@@ -1,6 +1,6 @@
 import fetch from "node-fetch";
 
-const URL = "https://team-ghost.onrender.com"; // Your Render URL
+const URL = "https://c032f485-6364-47da-874e-b04b6cb238f3-00-3stpaekpyv0im.sisko.replit.dev/login"; // Your Render URL
 
 async function ping() {
   try {
