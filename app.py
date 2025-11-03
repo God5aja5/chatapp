@@ -687,55 +687,89 @@ MAIN_HTML = """<!doctype html><html><head>
 <title>Ghost Projects Chat</title>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap" rel="stylesheet">
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700;800&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
 :root{
   --bg:#0a0e27;
   --card:#151b33;
   --accent:#8b5cf6;
   --accent-dark:#7c3aed;
-  --muted:#94a3b8;
+  --accent-light:#a78bfa;
+  --muted:#64748b;
   --text:#f1f5f9;
+  --text-secondary:#cbd5e1;
   --panel:#1a1f3a;
   --glass:rgba(139,92,246,0.05);
-  --border:rgba(139,92,246,0.1);
+  --border:rgba(139,92,246,0.15);
+  --shadow-sm:0 2px 8px rgba(0,0,0,0.15);
+  --shadow-md:0 4px 16px rgba(0,0,0,0.2);
+  --shadow-lg:0 8px 32px rgba(0,0,0,0.3);
+  --shadow-xl:0 16px 48px rgba(0,0,0,0.4);
   --msg-bg:#1e293b;
+  --msg-hover:#253248;
   --msg-me:linear-gradient(135deg,#8b5cf6,#7c3aed);
+  --msg-me-hover:linear-gradient(135deg,#9f7aea,#8b5cf6);
+  --success:#10b981;
+  --warning:#f59e0b;
+  --error:#ef4444;
+  --radius-sm:8px;
+  --radius-md:12px;
+  --radius-lg:16px;
+  --radius-xl:20px;
+  --transition-fast:150ms ease;
+  --transition-base:200ms ease;
+  --transition-slow:300ms ease;
 }
 *{box-sizing:border-box;margin:0;padding:0}
+::selection{background:rgba(139,92,246,0.3);color:#fff}
 html,body{
   height:100%;
-  font-family:'Inter',system-ui,Arial,sans-serif;
+  font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;
+  font-size:16px;
+  line-height:1.5;
   background:#0a0e27;
   background-image:
-    radial-gradient(at 10% 20%, rgba(139,92,246,0.08) 0px, transparent 50%),
-    radial-gradient(at 90% 80%, rgba(59,130,246,0.06) 0px, transparent 50%);
+    radial-gradient(at 10% 20%, rgba(139,92,246,0.12) 0px, transparent 50%),
+    radial-gradient(at 90% 80%, rgba(59,130,246,0.08) 0px, transparent 50%),
+    radial-gradient(at 50% 50%, rgba(168,85,247,0.04) 0px, transparent 50%);
   color:var(--text);
   overflow:hidden;
+  -webkit-font-smoothing:antialiased;
+  -moz-osx-font-smoothing:grayscale;
 }
 .app{
   display:flex;
   flex-direction:column;
   height:100vh;
   max-height:100vh;
+  position:relative;
 }
 .header{
   display:flex;
   align-items:center;
   gap:14px;
   padding:16px 20px;
-  background:rgba(21,27,51,0.6);
-  backdrop-filter:blur(20px);
+  background:rgba(21,27,51,0.75);
+  backdrop-filter:blur(24px) saturate(180%);
+  -webkit-backdrop-filter:blur(24px) saturate(180%);
   border-bottom:1px solid var(--border);
-  box-shadow:0 4px 20px rgba(0,0,0,0.3);
+  box-shadow:var(--shadow-lg);
   z-index:100;
+  position:relative;
 }
 .avatar{
-  width:52px;
-  height:52px;
-  border-radius:14px;
+  width:48px;
+  height:48px;
+  border-radius:var(--radius-md);
   overflow:hidden;
   border:2px solid var(--border);
-  box-shadow:0 4px 12px rgba(0,0,0,0.3);
+  box-shadow:var(--shadow-md);
+  transition:all var(--transition-base);
+  position:relative;
+}
+.avatar:hover{
+  transform:scale(1.05);
+  border-color:var(--accent);
+  box-shadow:0 0 0 4px rgba(139,92,246,0.1);
 }
 .avatar img{
   width:100%;
@@ -743,8 +777,9 @@ html,body{
   object-fit:cover;
 }
 .title{
-  font-weight:700;
+  font-weight:600;
   font-size:18px;
+  letter-spacing:-0.02em;
   background:linear-gradient(135deg,#f1f5f9,#cbd5e1);
   -webkit-background-clip:text;
   -webkit-text-fill-color:transparent;
@@ -756,72 +791,114 @@ html,body{
   display:flex;
   align-items:center;
   gap:6px;
+  font-weight:500;
 }
 .presence::before{
   content:'';
   width:8px;
   height:8px;
   border-radius:50%;
-  background:#10b981;
-  box-shadow:0 0 8px #10b981;
+  background:var(--success);
+  box-shadow:0 0 12px var(--success);
   animation:pulse 2s ease-in-out infinite;
 }
 @keyframes pulse{
-  0%,100%{opacity:1}
-  50%{opacity:0.5}
+  0%,100%{opacity:1;transform:scale(1)}
+  50%{opacity:0.6;transform:scale(0.95)}
 }
 .hamburger{
-  width:48px;
-  height:48px;
+  width:44px;
+  height:44px;
   background:var(--glass);
   border:1px solid var(--border);
-  border-radius:12px;
+  border-radius:var(--radius-md);
   display:flex;
   align-items:center;
   justify-content:center;
   cursor:pointer;
-  transition:all 0.3s ease;
+  transition:all var(--transition-base);
   font-size:20px;
+  position:relative;
+  overflow:hidden;
+}
+.hamburger::before{
+  content:'';
+  position:absolute;
+  inset:0;
+  background:radial-gradient(circle at center, transparent 0%, rgba(139,92,246,0.1) 100%);
+  opacity:0;
+  transition:opacity var(--transition-base);
 }
 .hamburger:hover{
-  background:rgba(139,92,246,0.15);
+  background:rgba(139,92,246,0.1);
   transform:scale(1.05);
+  border-color:var(--accent);
+}
+.hamburger:hover::before{
+  opacity:1;
+}
+.hamburger:active{
+  transform:scale(0.98);
 }
 .rooms-panel{
   position:fixed;
   left:16px;
   top:90px;
-  background:rgba(26,31,58,0.95);
-  backdrop-filter:blur(20px);
-  padding:12px;
-  border-radius:16px;
+  background:rgba(26,31,58,0.98);
+  backdrop-filter:blur(24px) saturate(180%);
+  -webkit-backdrop-filter:blur(24px) saturate(180%);
+  padding:16px;
+  border-radius:var(--radius-lg);
   border:1px solid var(--border);
   max-width:320px;
-  max-height:70vh;
+  max-height:calc(100vh - 120px);
   overflow-y:auto;
+  overflow-x:hidden;
   display:none;
   z-index:999;
-  box-shadow:0 20px 60px rgba(0,0,0,0.7);
-  animation:slideIn 0.3s ease-out;
+  box-shadow:var(--shadow-xl);
+  animation:slideIn var(--transition-slow);
 }
 @keyframes slideIn{
-  from{opacity:0;transform:translateY(-10px)}
-  to{opacity:1;transform:translateY(0)}
+  from{
+    opacity:0;
+    transform:translateY(-12px) scale(0.95);
+  }
+  to{
+    opacity:1;
+    transform:translateY(0) scale(1);
+  }
 }
 .rooms-panel .room{
-  padding:12px 14px;
-  border-radius:10px;
+  padding:14px 16px;
+  border-radius:var(--radius-md);
   cursor:pointer;
-  transition:all 0.2s ease;
-  margin-bottom:6px;
+  transition:all var(--transition-base);
+  margin-bottom:8px;
+  position:relative;
+  font-weight:500;
+  display:flex;
+  align-items:center;
+  gap:12px;
+}
+.rooms-panel .room::before{
+  content:'#';
+  color:var(--muted);
+  font-weight:600;
+  font-size:14px;
 }
 .rooms-panel .room:hover{
   background:rgba(139,92,246,0.1);
+  transform:translateX(4px);
 }
 .rooms-panel .room.active{
   background:var(--msg-me);
-  font-weight:700;
-  box-shadow:0 4px 12px rgba(139,92,246,0.4);
+  font-weight:600;
+  color:#fff;
+  box-shadow:var(--shadow-md);
+}
+.rooms-panel .room.active::before{
+  color:rgba(255,255,255,0.8);
 }
 .messages{
   flex:1;
