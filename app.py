@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Ghost Projects Chat - single-file Flask + Socket.IO application.
+Chat app - Flask + Socket.IO application.
 
 Features & fixes:
  - Room-scoped Socket.IO (sockets join/leave rooms properly)
@@ -18,12 +18,13 @@ import os
 import json
 import secrets
 import logging
-from datetime import datetime, timezone
+import random
+from datetime import datetime, timezone, timedelta
 from functools import wraps
 
 from flask import (
-    Flask, request, redirect, url_for, send_from_directory, render_template_string,
-    jsonify, flash, abort, session as flask_session
+    Flask, request, redirect, url_for, send_from_directory, render_template,
+    jsonify, flash, session as flask_session
 )
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import (
@@ -33,7 +34,11 @@ from flask_login import (
 from flask_socketio import SocketIO, join_room, leave_room
 from werkzeug.utils import secure_filename
 from werkzeug.security import generate_password_hash, check_password_hash
-from sqlalchemy import text as sa_text
+from sqlalchemy import text as sa_text, or_
+
+import requests
+
+from config import Config
 
 # Optional libs
 try:
@@ -67,30 +72,135 @@ except Exception:
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("ghost_chat")
 
+ADMIN_SETTINGS_KEYS = [
+    "APP_NAME", "APP_ICON", "APP_TAGLINE", "LOGIN_SUBTITLE", "REGISTER_SUBTITLE",
+    "DEFAULT_ROOM_NAME", "WELCOME_MESSAGE", "USER_JOIN_MESSAGE", "DEFAULT_AVATAR",
+    "THEME_ACCENT", "THEME_ACCENT_2", "THEME_BG", "THEME_PANEL", "THEME_CARD",
+    "THEME_TEXT", "THEME_MUTED", "THEME_BORDER"
+]
+
+def load_admin_settings():
+    if not os.path.exists(SETTINGS_PATH):
+        return
+    try:
+        with open(SETTINGS_PATH, "r", encoding="utf-8") as fh:
+            data = json.load(fh) or {}
+        for k in ADMIN_SETTINGS_KEYS:
+            if k in data:
+                app.config[k] = data[k]
+    except Exception:
+        logger.exception("Failed to load admin settings")
+
+def save_admin_settings(updates):
+    try:
+        data = {}
+        if os.path.exists(SETTINGS_PATH):
+            with open(SETTINGS_PATH, "r", encoding="utf-8") as fh:
+                data = json.load(fh) or {}
+        data.update(updates)
+        with open(SETTINGS_PATH, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2)
+    except Exception:
+        logger.exception("Failed to save admin settings")
+
+def refresh_app_strings():
+    global APP_NAME, APP_ICON, APP_TAGLINE, LOGIN_SUBTITLE, REGISTER_SUBTITLE
+    global DEFAULT_ROOM_NAME, WELCOME_MESSAGE, USER_JOIN_MESSAGE, DEFAULT_AVATAR
+    APP_NAME = app.config.get("APP_NAME", "Sukuna Chat 🔥")
+    APP_ICON = app.config.get("APP_ICON", "👻")
+    APP_TAGLINE = app.config.get("APP_TAGLINE", "Chat that feels alive")
+    LOGIN_SUBTITLE = app.config.get("LOGIN_SUBTITLE", f"Sign in to {APP_NAME}")
+    REGISTER_SUBTITLE = app.config.get("REGISTER_SUBTITLE", "Create your account to get started")
+    DEFAULT_ROOM_NAME = app.config.get("DEFAULT_ROOM_NAME", f"{APP_NAME} chat")
+    WELCOME_MESSAGE = app.config.get("WELCOME_MESSAGE", f"Welcome to {APP_NAME} chat! Be kind.")
+    USER_JOIN_MESSAGE = app.config.get("USER_JOIN_MESSAGE", "👋 {user} joined {app} chat")
+    DEFAULT_AVATAR = app.config.get("DEFAULT_AVATAR", "https://negative-orange-ql4jplfnvn.edgeone.app/1767275981651.jpg")
+
+def now_utc():
+    return datetime.now(timezone.utc)
+
+def ensure_aware(dt):
+    if not dt:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+def is_expired(dt):
+    dt_aware = ensure_aware(dt)
+    return (not dt_aware) or (dt_aware < now_utc())
+
+def generate_otp():
+    return str(random.randint(100000, 999999))
+
+def send_otp_email(to_email, otp, purpose, display_name):
+    api_key = app.config.get("VLY_API_KEY") or ""
+    api_url = app.config.get("VLY_API_URL") or "https://email.vly.ai/send_otp"
+    app_name = APP_NAME or "Chat App"
+    if not api_key:
+        logger.warning("VLY API key missing")
+        return False
+    custom_message = f"Hi {display_name}, use this OTP to {purpose} in {app_name}."
+    try:
+        data = {
+            "to": to_email,
+            "otp": otp,
+            "appName": app_name,
+            "customMessage": custom_message
+        }
+        headers = {
+            "x-api-key": api_key,
+            "Content-Type": "application/json"
+        }
+        resp = requests.post(api_url, json=data, headers=headers, timeout=15)
+        if resp.status_code != 200:
+            logger.error("VLY send failed: %s %s", resp.status_code, resp.text)
+            return False
+        return True
+    except Exception:
+        logger.exception("VLY send failed")
+        return False
+
 # Configuration
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 DB_PATH = os.path.join(BASE_DIR, "chat.db")
 UPLOAD_FOLDER = os.path.join(BASE_DIR, "uploads")
 STICKER_FOLDER = os.path.join(BASE_DIR, "stickers")
+SETTINGS_PATH = os.path.join(BASE_DIR, "admin_settings.json")
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(STICKER_FOLDER, exist_ok=True)
 
-ALLOWED_IMAGE_EXT = {"png","jpg","jpeg","gif","webp"}
-ALLOWED_VIDEO_EXT = {"mp4","webm","ogg","mov"}
-MAX_FILE_SIZE = 25 * 1024 * 1024   # 25 MB
-MAX_FILES_PER_MESSAGE = 5
-THUMB_MAX_SIZE = (1024, 1024)
-LONG_MESSAGE_LIMIT = 300  # chars; over this, server writes a .txt file and attaches it
-
-DEFAULT_AVATAR = "https://i.ibb.co/3mwVTQw9/x.jpg"
-
 app = Flask(__name__)
-app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "dev-secret-change-me")
+app.config.from_object(Config)
 app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///" + DB_PATH
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 app.config["STICKER_FOLDER"] = STICKER_FOLDER
+
+ALLOWED_IMAGE_EXT = {"png","jpg","jpeg","gif","webp"}
+ALLOWED_VIDEO_EXT = {"mp4","webm","ogg","mov"}
+MAX_FILE_SIZE = int(app.config.get("MAX_FILE_SIZE", 25 * 1024 * 1024))
+MAX_FILES_PER_MESSAGE = int(app.config.get("MAX_FILES_PER_MESSAGE", 5))
+THUMB_MAX_SIZE = (1024, 1024)
+LONG_MESSAGE_LIMIT = int(app.config.get("LONG_MESSAGE_LIMIT", 300))  # chars; over this, server writes a .txt file and attaches it
+
+DEFAULT_AVATAR = ""
+APP_NAME = ""
+APP_ICON = ""
+APP_TAGLINE = ""
+LOGIN_SUBTITLE = ""
+REGISTER_SUBTITLE = ""
+DEFAULT_ROOM_NAME = ""
+WELCOME_MESSAGE = ""
+USER_JOIN_MESSAGE = ""
+
 app.config["MAX_CONTENT_LENGTH"] = 6 * MAX_FILE_SIZE
+
+load_admin_settings()
+refresh_app_strings()
+
+EMAIL_VERIFY_TTL_MIN = int(app.config.get("EMAIL_VERIFY_TTL_MIN", 15))
+RESET_TTL_MIN = int(app.config.get("RESET_TTL_MIN", 10))
 
 app.logger.setLevel(logging.DEBUG)
 
@@ -106,12 +216,19 @@ class User(UserMixin, db.Model):
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(80), unique=True, nullable=False, index=True)
     password_hash = db.Column(db.String(256), nullable=False)
+    email = db.Column(db.String(190), unique=True, index=True)
+    email_verified = db.Column(db.Boolean, default=False)
+    email_verify_otp = db.Column(db.String(16))
+    email_verify_expires = db.Column(db.DateTime)
+    reset_otp = db.Column(db.String(16))
+    reset_expires = db.Column(db.DateTime)
     display_name = db.Column(db.String(120))
     avatar = db.Column(db.String(256))
     bio = db.Column(db.Text)
     session_version = db.Column(db.Integer, default=0)
     last_seen = db.Column(db.DateTime)
     show_online = db.Column(db.Boolean, default=True)
+    is_admin = db.Column(db.Boolean, default=False)
 
     def set_password(self, pw):
         self.password_hash = generate_password_hash(pw)
@@ -165,7 +282,51 @@ class Notification(db.Model):
 # ---------------------------
 # Helpers & stickers
 # ---------------------------
+EMOJI_STICKERS = [
+    "😀","😁","😂","🤣","😃","😄","😅","😆","😉","😊","😋","😎","😍","😘","🥰","😗",
+    "😙","😚","🙂","🤗","🤩","🤔","🤨","😐","😑","😶","🙄","😏","😣","😥","😮","🤐",
+    "😯","😪","😫","😴","😌","😛","😜","😝","🤤","😒","😓","😔","😕","🙃","🫠","🫡",
+    "🤕","🤒","🤧","🥳","🥸","😷","🤢","🤮","🤯","🥶","🥵","😵","😵‍💫","🤠","🥺","😭",
+    "😤","😡","🤬","😱","😨","😰","😳","😬","🫣","🫢","🫥","😇","🤓","🧐","🥹","😈",
+    "👻","💀","☠️","👽","🤖","💩","😺","😸","😹","😻","😼","😽","🙀","😿","😾","🐶",
+    "🐱","🐭","🐹","🐰","🦊","🐻","🐼","🐨","🐯","🦁","🐮","🐷","🐸","🐵","🐧","🐦",
+    "🦄","🐝","🦋","🐢","🦖","🦕","🐙","🦑","🐳","🐬","🦈","🐊","🐍","🦓","🦒","🐘",
+    "🦛","🦥","🦦","🦨","🦔","🐿️","🍎","🍊","🍉","🍓","🍒","🍑","🍍","🥭","🍌","🥝",
+    "🍇","🍔","🍟","🍕","🌮","🍣","🍜","🍩","🍪","🎂","🍦","🍭","🍫","🥤","☕","🧋",
+    "⚽","🏀","🏈","⚾","🎾","🏐","🎮","🎧","🎸","🎹","🥁","🎷","🎯","🚀","🛸","🏆",
+    "🌈","🌙","⭐","🌟","🔥","💎","🎁","💡","📌","📎","✏️","✅","❌","🟢","🟡","🔴",
+    "🟣","🔵","🟠","⚡","💬","❤️","🧡","💛","💚","💙","🤍","🤎","💜"
+]
+
+EMOJI_PALETTE = [
+    "#0f172a", "#1e293b", "#0b3d3b", "#16324f", "#2a2b52", "#2f2a40",
+    "#3a1f2b", "#3b2f1f", "#2f3b1f", "#1f3b2a", "#1f2f3b", "#3b1f3a"
+]
+
+EMOJI_STICKER_MAP = {}
+
+def emoji_to_filename(emoji):
+    codes = "-".join(f"{ord(ch):x}" for ch in emoji)
+    return f"emoji-{codes}.svg"
+
+def build_emoji_svg(emoji, bg):
+    return (
+        "<svg xmlns='http://www.w3.org/2000/svg' width='256' height='256'>"
+        f"<rect width='256' height='256' rx='32' fill='{bg}'/>"
+        "<text x='50%' y='52%' text-anchor='middle' dominant-baseline='middle' "
+        "font-size='140' font-family='Apple Color Emoji, Segoe UI Emoji, Noto Color Emoji, sans-serif'>"
+        f"{emoji}</text></svg>"
+    )
+
 def init_stickers():
+    for idx, emoji in enumerate(EMOJI_STICKERS):
+        name = emoji_to_filename(emoji)
+        EMOJI_STICKER_MAP[name] = emoji
+        path = os.path.join(STICKER_FOLDER, name)
+        if not os.path.exists(path):
+            svg = build_emoji_svg(emoji, EMOJI_PALETTE[idx % len(EMOJI_PALETTE)])
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(svg)
     samples = {
         "sticker-smile.svg": "<svg xmlns='http://www.w3.org/2000/svg' width='200' height='200'><rect width='200' height='200' rx='20' fill='#ffd54f'/><circle cx='100' cy='90' r='50' fill='#fff59d'/><circle cx='80' cy='80' r='8' fill='#000'/><circle cx='120' cy='80' r='8' fill='#000'/><path d='M70 120 Q100 150 130 120' stroke='#000' stroke-width='6' fill='none' stroke-linecap='round'/></svg>",
         "sticker-heart.svg": "<svg xmlns='http://www.w3.org/2000/svg' width='200' height='200'><rect width='200' height='200' rx='20' fill='#f8bbd0'/><path d='M100 150 L80 130 C30 90 60 40 100 70 C140 40 170 90 120 130 Z' fill='#e91e63'/></svg>",
@@ -175,6 +336,7 @@ def init_stickers():
         if not os.path.exists(path):
             with open(path, "w", encoding="utf-8") as fh:
                 fh.write(svg)
+
 init_stickers()
 
 def allowed_extension(filename):
@@ -202,13 +364,23 @@ def url_sticker(fn):
     except Exception:
         return ""
 
-def url_static_asset(fn):
-    if fn == "default-avatar.png":
-        return DEFAULT_AVATAR
+def list_stickers():
+    out = []
     try:
-        return url_for("static_asset", path=fn)
+        for fn in sorted(os.listdir(STICKER_FOLDER)):
+            if fn.startswith("."):
+                continue
+            ext = fn.rsplit(".", 1)[-1].lower()
+            if ext not in {"svg", "png", "webp", "gif", "jpg", "jpeg"}:
+                continue
+            out.append({
+                "filename": fn,
+                "url": url_sticker(fn),
+                "emoji": EMOJI_STICKER_MAP.get(fn)
+            })
     except Exception:
-        return ""
+        logger.exception("Failed to list stickers")
+    return out
 
 def user_to_dict(u):
     if not u:
@@ -219,7 +391,8 @@ def user_to_dict(u):
         "display_name": u.display_name or u.username,
         "avatar": url_upload(u.avatar) if u.avatar else DEFAULT_AVATAR,
         "bio": u.bio or "",
-        "last_seen": u.last_seen.isoformat() if u.last_seen else None
+        "last_seen": u.last_seen.isoformat() if u.last_seen else None,
+        "is_admin": bool(getattr(u, "is_admin", False))
     }
 
 # ---------------------------
@@ -249,6 +422,39 @@ def ensure_message_columns():
                 logger.exception("Failed to add column %s", name)
     except Exception:
         logger.exception("Migration check failed")
+    finally:
+        if conn: conn.close()
+
+def ensure_user_columns():
+    conn = None
+    try:
+        conn = db.engine.connect()
+        res = conn.execute(sa_text("PRAGMA table_info(user)")).fetchall()
+        existing_cols = [r[1] for r in res]
+        to_add = []
+        if "is_admin" not in existing_cols:
+            to_add.append(("is_admin", "BOOLEAN", "0"))
+        if "email" not in existing_cols:
+            to_add.append(("email", "TEXT", "NULL"))
+        if "email_verified" not in existing_cols:
+            to_add.append(("email_verified", "BOOLEAN", "0"))
+        if "email_verify_otp" not in existing_cols:
+            to_add.append(("email_verify_otp", "TEXT", "NULL"))
+        if "email_verify_expires" not in existing_cols:
+            to_add.append(("email_verify_expires", "DATETIME", "NULL"))
+        if "reset_otp" not in existing_cols:
+            to_add.append(("reset_otp", "TEXT", "NULL"))
+        if "reset_expires" not in existing_cols:
+            to_add.append(("reset_expires", "DATETIME", "NULL"))
+        for name, typ, default in to_add:
+            try:
+                sql = f"ALTER TABLE user ADD COLUMN {name} {typ} DEFAULT {default}"
+                logger.info("MIGRATE: %s", sql)
+                conn.execute(sa_text(sql))
+            except Exception:
+                logger.exception("Failed to add column %s", name)
+    except Exception:
+        logger.exception("User migration check failed")
     finally:
         if conn: conn.close()
 
@@ -335,1454 +541,7 @@ def uploaded_file(filename):
 def sticker_file(filename):
     return send_from_directory(app.config["STICKER_FOLDER"], filename)
 
-@app.route("/static/<path:path>")
-def static_asset(path):
-    if path == "default-avatar.png":
-        return redirect(DEFAULT_AVATAR)
-    abort(404)
 
-# ---------------------------
-# HTML templates (LOGIN/REGISTER/MAIN)
-# ---------------------------
-
-LOGIN_HTML = """<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Ghost Projects — Sign in</title>
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700;800&display=swap');
-:root{
-  --bg:#0a0e27;
-  --card:#151b33;
-  --accent:#8b5cf6;
-  --accent-hover:#7c3aed;
-  --muted:#94a3b8;
-  --text:#f1f5f9;
-  --border:rgba(139,92,246,0.1);
-}
-*{box-sizing:border-box;margin:0;padding:0}
-body{
-  font-family:'Inter',system-ui,Arial,sans-serif;
-  background:#0a0e27;
-  background-image:
-    radial-gradient(at 20% 30%, rgba(139,92,246,0.15) 0px, transparent 50%),
-    radial-gradient(at 80% 70%, rgba(59,130,246,0.1) 0px, transparent 50%);
-  min-height:100vh;
-  display:flex;
-  align-items:center;
-  justify-content:center;
-  color:var(--text);
-  padding:20px;
-}
-.card{
-  width:100%;
-  max-width:440px;
-  background:rgba(21,27,51,0.8);
-  backdrop-filter:blur(20px);
-  padding:48px 40px;
-  border-radius:24px;
-  border:1px solid var(--border);
-  box-shadow:0 20px 60px rgba(0,0,0,0.5), 0 0 100px rgba(139,92,246,0.1);
-  animation:slideUp 0.5s ease-out;
-}
-@keyframes slideUp{
-  from{opacity:0;transform:translateY(30px)}
-  to{opacity:1;transform:translateY(0)}
-}
-.logo{
-  text-align:center;
-  margin-bottom:32px;
-}
-.logo-icon{
-  width:64px;
-  height:64px;
-  background:linear-gradient(135deg,#8b5cf6,#6366f1);
-  border-radius:16px;
-  display:inline-flex;
-  align-items:center;
-  justify-content:center;
-  font-size:32px;
-  margin-bottom:16px;
-  box-shadow:0 8px 24px rgba(139,92,246,0.3);
-}
-h2{
-  font-size:28px;
-  font-weight:800;
-  text-align:center;
-  margin-bottom:8px;
-  background:linear-gradient(135deg,#f1f5f9,#cbd5e1);
-  -webkit-background-clip:text;
-  -webkit-text-fill-color:transparent;
-  background-clip:text;
-}
-.subtitle{
-  text-align:center;
-  color:var(--muted);
-  font-size:14px;
-  margin-bottom:32px;
-}
-input{
-  width:100%;
-  padding:14px 18px;
-  border-radius:12px;
-  border:1px solid rgba(148,163,184,0.1);
-  background:rgba(30,41,59,0.5);
-  color:var(--text);
-  margin-bottom:16px;
-  font-size:15px;
-  transition:all 0.3s ease;
-}
-input:focus{
-  outline:none;
-  border-color:var(--accent);
-  background:rgba(30,41,59,0.8);
-  box-shadow:0 0 0 4px rgba(139,92,246,0.1);
-}
-input::placeholder{color:rgba(148,163,184,0.5)}
-label{
-  display:flex;
-  align-items:center;
-  gap:8px;
-  margin:16px 0 24px;
-  color:var(--muted);
-  font-size:14px;
-  cursor:pointer;
-}
-input[type="checkbox"]{
-  width:18px;
-  height:18px;
-  margin:0;
-  cursor:pointer;
-  accent-color:var(--accent);
-}
-button{
-  width:100%;
-  padding:14px;
-  border-radius:12px;
-  border:none;
-  background:linear-gradient(135deg,#8b5cf6,#7c3aed);
-  color:white;
-  font-weight:700;
-  font-size:15px;
-  cursor:pointer;
-  transition:all 0.3s ease;
-  box-shadow:0 4px 16px rgba(139,92,246,0.4);
-}
-button:hover{
-  transform:translateY(-2px);
-  box-shadow:0 8px 24px rgba(139,92,246,0.5);
-}
-button:active{transform:translateY(0)}
-.small{
-  font-size:14px;
-  color:var(--muted);
-  text-align:center;
-  margin-top:24px;
-}
-a{
-  color:var(--accent);
-  text-decoration:none;
-  font-weight:600;
-  transition:color 0.3s ease;
-}
-a:hover{color:#a78bfa}
-.flash{
-  background:rgba(251,191,36,0.1);
-  border:1px solid rgba(251,191,36,0.3);
-  color:#fbbf24;
-  padding:12px 16px;
-  border-radius:10px;
-  margin-bottom:20px;
-  font-size:14px;
-  text-align:center;
-}
-</style></head><body>
-<div class="card">
-  <div class="logo">
-    <div class="logo-icon">👻</div>
-    <h2>Welcome Back</h2>
-    <div class="subtitle">Sign in to Ghost Projects</div>
-  </div>
-  {% with messages = get_flashed_messages() %}
-    {% if messages %}<div class="flash">{{ messages[0] }}</div>{% endif %}
-  {% endwith %}
-  <form method="post" action="{{ url_for('login') }}">
-    <input name="username" placeholder="Username" autofocus />
-    <input name="password" type="password" placeholder="Password" />
-    <label><input type="checkbox" name="remember"> Remember me for 30 days</label>
-    <button>Sign in</button>
-  </form>
-  <div class="small">New to Ghost Projects? <a href="{{ url_for('register') }}">Create account</a></div>
-</div>
-</body></html>"""
-
-REGISTER_HTML = """<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Ghost Projects — Register</title>
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700;800&display=swap');
-:root{
-  --bg:#0a0e27;
-  --card:#151b33;
-  --accent:#8b5cf6;
-  --accent-hover:#7c3aed;
-  --muted:#94a3b8;
-  --text:#f1f5f9;
-  --border:rgba(139,92,246,0.1);
-}
-*{box-sizing:border-box;margin:0;padding:0}
-body{
-  font-family:'Inter',system-ui,Arial,sans-serif;
-  background:#0a0e27;
-  background-image:
-    radial-gradient(at 20% 30%, rgba(139,92,246,0.15) 0px, transparent 50%),
-    radial-gradient(at 80% 70%, rgba(59,130,246,0.1) 0px, transparent 50%);
-  min-height:100vh;
-  display:flex;
-  align-items:center;
-  justify-content:center;
-  color:var(--text);
-  padding:20px;
-}
-.card{
-  width:100%;
-  max-width:440px;
-  background:rgba(21,27,51,0.8);
-  backdrop-filter:blur(20px);
-  padding:48px 40px;
-  border-radius:24px;
-  border:1px solid var(--border);
-  box-shadow:0 20px 60px rgba(0,0,0,0.5), 0 0 100px rgba(139,92,246,0.1);
-  animation:slideUp 0.5s ease-out;
-}
-@keyframes slideUp{
-  from{opacity:0;transform:translateY(30px)}
-  to{opacity:1;transform:translateY(0)}
-}
-.logo{
-  text-align:center;
-  margin-bottom:32px;
-}
-.logo-icon{
-  width:64px;
-  height:64px;
-  background:linear-gradient(135deg,#8b5cf6,#6366f1);
-  border-radius:16px;
-  display:inline-flex;
-  align-items:center;
-  justify-content:center;
-  font-size:32px;
-  margin-bottom:16px;
-  box-shadow:0 8px 24px rgba(139,92,246,0.3);
-}
-h2{
-  font-size:28px;
-  font-weight:800;
-  text-align:center;
-  margin-bottom:8px;
-  background:linear-gradient(135deg,#f1f5f9,#cbd5e1);
-  -webkit-background-clip:text;
-  -webkit-text-fill-color:transparent;
-  background-clip:text;
-}
-.subtitle{
-  text-align:center;
-  color:var(--muted);
-  font-size:14px;
-  margin-bottom:32px;
-}
-input{
-  width:100%;
-  padding:14px 18px;
-  border-radius:12px;
-  border:1px solid rgba(148,163,184,0.1);
-  background:rgba(30,41,59,0.5);
-  color:var(--text);
-  margin-bottom:16px;
-  font-size:15px;
-  transition:all 0.3s ease;
-}
-input:focus{
-  outline:none;
-  border-color:var(--accent);
-  background:rgba(30,41,59,0.8);
-  box-shadow:0 0 0 4px rgba(139,92,246,0.1);
-}
-input::placeholder{color:rgba(148,163,184,0.5)}
-button{
-  width:100%;
-  padding:14px;
-  border-radius:12px;
-  border:none;
-  background:linear-gradient(135deg,#8b5cf6,#7c3aed);
-  color:white;
-  font-weight:700;
-  font-size:15px;
-  cursor:pointer;
-  transition:all 0.3s ease;
-  box-shadow:0 4px 16px rgba(139,92,246,0.4);
-  margin-top:8px;
-}
-button:hover{
-  transform:translateY(-2px);
-  box-shadow:0 8px 24px rgba(139,92,246,0.5);
-}
-button:active{transform:translateY(0)}
-.small{
-  font-size:14px;
-  color:var(--muted);
-  text-align:center;
-  margin-top:24px;
-}
-a{
-  color:var(--accent);
-  text-decoration:none;
-  font-weight:600;
-  transition:color 0.3s ease;
-}
-a:hover{color:#a78bfa}
-.note{
-  background:rgba(59,130,246,0.1);
-  border:1px solid rgba(59,130,246,0.2);
-  color:#60a5fa;
-  padding:12px 16px;
-  border-radius:10px;
-  font-size:13px;
-  margin-bottom:16px;
-  line-height:1.6;
-}
-.flash{
-  background:rgba(251,191,36,0.1);
-  border:1px solid rgba(251,191,36,0.3);
-  color:#fbbf24;
-  padding:12px 16px;
-  border-radius:10px;
-  margin-bottom:20px;
-  font-size:14px;
-  text-align:center;
-}
-</style></head><body>
-<div class="card">
-  <div class="logo">
-    <div class="logo-icon">👻</div>
-    <h2>Join Ghost Projects</h2>
-    <div class="subtitle">Create your account to get started</div>
-  </div>
-  {% with messages = get_flashed_messages() %}
-    {% if messages %}<div class="flash">{{ messages[0] }}</div>{% endif %}
-  {% endwith %}
-  <form method="post" action="{{ url_for('register') }}">
-    <input name="username" placeholder="Username" required>
-    <input name="display_name" placeholder="Display name">
-    <div class="note">💡 Tip: Enter your Telegram profile name in the display name field so people can find you.</div>
-    <input name="password" type="password" placeholder="Password" required>
-    <button>Create account</button>
-  </form>
-  <div class="small">Already have an account? <a href="{{ url_for('login') }}">Sign in</a></div>
-</div>
-</body></html>"""
-
-NOTFOUND_HTML = """<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>404</title></head><body style="font-family:Inter,Arial;padding:24px;background:#f7fafc;color:#0b1220">
-<h1>404 — Not found</h1><p>The requested URL was not found on the server.</p><p><a href="{{ url_for('index') }}">Home</a></p></body></html>"""
-
-MAIN_HTML = """<!doctype html><html><head>
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>Ghost Projects Chat</title>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap" rel="stylesheet">
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700;800&display=swap');
-:root{
-  --bg:#0a0e27;
-  --card:#151b33;
-  --accent:#8b5cf6;
-  --accent-dark:#7c3aed;
-  --muted:#94a3b8;
-  --text:#f1f5f9;
-  --panel:#1a1f3a;
-  --glass:rgba(139,92,246,0.05);
-  --border:rgba(139,92,246,0.1);
-  --msg-bg:#1e293b;
-  --msg-me:linear-gradient(135deg,#8b5cf6,#7c3aed);
-}
-*{box-sizing:border-box;margin:0;padding:0}
-html,body{
-  height:100%;
-  font-family:'Inter',system-ui,Arial,sans-serif;
-  background:#0a0e27;
-  background-image:
-    radial-gradient(at 10% 20%, rgba(139,92,246,0.08) 0px, transparent 50%),
-    radial-gradient(at 90% 80%, rgba(59,130,246,0.06) 0px, transparent 50%);
-  color:var(--text);
-  overflow:hidden;
-}
-.app{
-  display:flex;
-  flex-direction:column;
-  height:100vh;
-  max-height:100vh;
-}
-.header{
-  display:flex;
-  align-items:center;
-  gap:14px;
-  padding:16px 20px;
-  background:rgba(21,27,51,0.6);
-  backdrop-filter:blur(20px);
-  border-bottom:1px solid var(--border);
-  box-shadow:0 4px 20px rgba(0,0,0,0.3);
-  z-index:100;
-}
-.avatar{
-  width:52px;
-  height:52px;
-  border-radius:14px;
-  overflow:hidden;
-  border:2px solid var(--border);
-  box-shadow:0 4px 12px rgba(0,0,0,0.3);
-}
-.avatar img{
-  width:100%;
-  height:100%;
-  object-fit:cover;
-}
-.title{
-  font-weight:700;
-  font-size:18px;
-  background:linear-gradient(135deg,#f1f5f9,#cbd5e1);
-  -webkit-background-clip:text;
-  -webkit-text-fill-color:transparent;
-  background-clip:text;
-}
-.presence{
-  font-size:13px;
-  color:var(--muted);
-  display:flex;
-  align-items:center;
-  gap:6px;
-}
-.presence::before{
-  content:'';
-  width:8px;
-  height:8px;
-  border-radius:50%;
-  background:#10b981;
-  box-shadow:0 0 8px #10b981;
-  animation:pulse 2s ease-in-out infinite;
-}
-@keyframes pulse{
-  0%,100%{opacity:1}
-  50%{opacity:0.5}
-}
-.hamburger{
-  width:48px;
-  height:48px;
-  background:var(--glass);
-  border:1px solid var(--border);
-  border-radius:12px;
-  display:flex;
-  align-items:center;
-  justify-content:center;
-  cursor:pointer;
-  transition:all 0.3s ease;
-  font-size:20px;
-}
-.hamburger:hover{
-  background:rgba(139,92,246,0.15);
-  transform:scale(1.05);
-}
-.rooms-panel{
-  position:fixed;
-  left:16px;
-  top:90px;
-  background:rgba(26,31,58,0.95);
-  backdrop-filter:blur(20px);
-  padding:12px;
-  border-radius:16px;
-  border:1px solid var(--border);
-  max-width:320px;
-  max-height:70vh;
-  overflow-y:auto;
-  display:none;
-  z-index:999;
-  box-shadow:0 20px 60px rgba(0,0,0,0.7);
-  animation:slideIn 0.3s ease-out;
-}
-@keyframes slideIn{
-  from{opacity:0;transform:translateY(-10px)}
-  to{opacity:1;transform:translateY(0)}
-}
-.rooms-panel .room{
-  padding:12px 14px;
-  border-radius:10px;
-  cursor:pointer;
-  transition:all 0.2s ease;
-  margin-bottom:6px;
-}
-.rooms-panel .room:hover{
-  background:rgba(139,92,246,0.1);
-}
-.rooms-panel .room.active{
-  background:var(--msg-me);
-  font-weight:700;
-  box-shadow:0 4px 12px rgba(139,92,246,0.4);
-}
-.messages{
-  flex:1;
-  overflow-y:auto;
-  overflow-x:hidden;
-  padding:20px 16px 180px 16px;
-  -webkit-overflow-scrolling:touch;
-  scroll-behavior:smooth;
-  display:flex;
-  flex-direction:column;
-}
-.messages::-webkit-scrollbar{width:8px}
-.messages::-webkit-scrollbar-track{background:transparent}
-.messages::-webkit-scrollbar-thumb{
-  background:rgba(139,92,246,0.3);
-  border-radius:10px;
-}
-.messages::-webkit-scrollbar-thumb:hover{background:rgba(139,92,246,0.5)}
-.msg{
-  max-width:75%;
-  padding:14px 18px;
-  border-radius:16px;
-  margin-bottom:12px;
-  background:var(--msg-bg);
-  border:1px solid rgba(148,163,184,0.05);
-  box-shadow:0 4px 16px rgba(0,0,0,0.3);
-  position:relative;
-  animation:messageSlide 0.3s ease-out;
-  word-wrap:break-word;
-}
-@keyframes messageSlide{
-  from{opacity:0;transform:translateY(10px)}
-  to{opacity:1;transform:translateY(0)}
-}
-.msg.me{
-  align-self:flex-end;
-  background:var(--msg-me);
-  color:white;
-  border:1px solid rgba(139,92,246,0.3);
-  box-shadow:0 4px 20px rgba(139,92,246,0.4);
-}
-.meta{
-  font-size:12px;
-  color:var(--muted);
-  margin-bottom:8px;
-  font-weight:600;
-}
-.msg.me .meta{color:rgba(255,255,255,0.8)}
-.text{
-  line-height:1.6;
-  font-size:15px;
-}
-.attach{
-  margin-top:12px;
-  display:flex;
-  gap:10px;
-  flex-wrap:wrap;
-}
-.attach img, .attach video{
-  max-width:200px;
-  border-radius:12px;
-  object-fit:cover;
-  max-height:280px;
-  cursor:pointer;
-  transition:transform 0.2s ease;
-  border:2px solid rgba(139,92,246,0.2);
-}
-.attach img:hover, .attach video:hover{
-  transform:scale(1.02);
-}
-.reactions{
-  display:flex;
-  gap:6px;
-  margin-top:10px;
-  flex-wrap:wrap;
-}
-.react-pill{
-  background:rgba(139,92,246,0.15);
-  border:1px solid rgba(139,92,246,0.3);
-  padding:6px 12px;
-  border-radius:999px;
-  font-size:13px;
-  cursor:pointer;
-  transition:all 0.2s ease;
-}
-.react-pill:hover{
-  background:rgba(139,92,246,0.25);
-  transform:scale(1.05);
-}
-.msg .actions{
-  position:absolute;
-  right:10px;
-  top:10px;
-  opacity:0;
-  transition:opacity 0.2s ease;
-  display:flex;
-  gap:6px;
-}
-.msg:hover .actions{opacity:1}
-.msg .actions button{
-  background:rgba(0,0,0,0.5);
-  border:none;
-  padding:6px 10px;
-  border-radius:8px;
-  cursor:pointer;
-  font-size:16px;
-  transition:all 0.2s ease;
-}
-.msg .actions button:hover{
-  background:rgba(0,0,0,0.7);
-  transform:scale(1.1);
-}
-.bottom{
-  position:fixed;
-  left:0;
-  right:0;
-  bottom:0;
-  padding:16px;
-  background:linear-gradient(to top, rgba(10,14,39,0.98) 0%, rgba(10,14,39,0.9) 70%, transparent 100%);
-  backdrop-filter:blur(10px);
-  display:flex;
-  justify-content:center;
-  z-index:50;
-}
-.inputbar{
-  width:100%;
-  max-width:1000px;
-  padding:10px 12px;
-  background:rgba(21,27,51,0.9);
-  backdrop-filter:blur(20px);
-  border:1px solid var(--border);
-  border-radius:16px;
-  display:flex;
-  gap:10px;
-  align-items:center;
-  box-shadow:0 8px 32px rgba(0,0,0,0.5);
-  transition:box-shadow 0.3s ease;
-}
-.inputbar:focus-within{
-  box-shadow:0 8px 32px rgba(139,92,246,0.4);
-  border-color:var(--accent);
-}
-.icon{
-  width:48px;
-  height:48px;
-  border-radius:12px;
-  background:var(--glass);
-  border:1px solid var(--border);
-  display:flex;
-  align-items:center;
-  justify-content:center;
-  border:none;
-  color:var(--text);
-  font-size:22px;
-  cursor:pointer;
-  transition:all 0.2s ease;
-  flex-shrink:0;
-}
-.icon:hover{
-  background:rgba(139,92,246,0.2);
-  transform:scale(1.05);
-}
-.textarea{
-  flex:1;
-  border:none;
-  background:transparent;
-  color:var(--text);
-  outline:none;
-  padding:8px 12px;
-  border-radius:10px;
-  min-height:48px;
-  max-height:120px;
-  resize:none;
-  font-size:15px;
-  font-family:'Inter',system-ui,Arial,sans-serif;
-}
-.textarea::placeholder{color:rgba(148,163,184,0.5)}
-.send{
-  padding:12px 20px;
-  border-radius:12px;
-  border:none;
-  background:var(--msg-me);
-  color:white;
-  font-weight:700;
-  font-size:15px;
-  cursor:pointer;
-  transition:all 0.3s ease;
-  box-shadow:0 4px 16px rgba(139,92,246,0.4);
-  flex-shrink:0;
-}
-.send:hover{
-  transform:translateY(-2px);
-  box-shadow:0 8px 24px rgba(139,92,246,0.6);
-}
-.send:active{transform:translateY(0)}
-.preview-row{
-  position:fixed;
-  left:16px;
-  right:16px;
-  bottom:100px;
-  display:flex;
-  gap:10px;
-  overflow-x:auto;
-  padding:10px;
-  background:rgba(21,27,51,0.9);
-  backdrop-filter:blur(20px);
-  border-radius:12px;
-  border:1px solid var(--border);
-}
-.preview-thumb{
-  width:90px;
-  height:90px;
-  border-radius:12px;
-  object-fit:cover;
-  border:2px solid var(--border);
-}
-.toast{
-  position:fixed;
-  left:50%;
-  transform:translateX(-50%);
-  bottom:200px;
-  background:rgba(21,27,51,0.95);
-  backdrop-filter:blur(20px);
-  border:1px solid var(--border);
-  color:#fff;
-  padding:12px 20px;
-  border-radius:12px;
-  z-index:9999;
-  opacity:0;
-  transition:all 0.3s ease;
-  box-shadow:0 8px 24px rgba(0,0,0,0.5);
-  font-size:14px;
-  font-weight:600;
-}
-.toast.show{
-  opacity:1;
-  bottom:220px;
-}
-.notif-center{
-  position:fixed;
-  right:16px;
-  top:90px;
-  background:rgba(26,31,58,0.95);
-  backdrop-filter:blur(20px);
-  border:1px solid var(--border);
-  padding:16px;
-  border-radius:16px;
-  max-width:380px;
-  max-height:70vh;
-  overflow-y:auto;
-  display:none;
-  z-index:999;
-  box-shadow:0 20px 60px rgba(0,0,0,0.7);
-  animation:slideIn 0.3s ease-out;
-}
-.settings-modal{
-  position:fixed;
-  right:16px;
-  bottom:120px;
-  background:rgba(26,31,58,0.95);
-  backdrop-filter:blur(20px);
-  border:1px solid var(--border);
-  padding:20px;
-  border-radius:16px;
-  max-width:480px;
-  max-height:75vh;
-  overflow-y:auto;
-  display:none;
-  z-index:999;
-  box-shadow:0 20px 60px rgba(0,0,0,0.7);
-  animation:slideIn 0.3s ease-out;
-}
-.settings-modal h3{
-  margin:12px 0;
-  font-size:20px;
-  font-weight:700;
-  background:linear-gradient(135deg,#f1f5f9,#cbd5e1);
-  -webkit-background-clip:text;
-  -webkit-text-fill-color:transparent;
-  background-clip:text;
-}
-.settings-modal strong{
-  display:block;
-  margin-top:16px;
-  margin-bottom:8px;
-  color:var(--accent);
-  font-weight:600;
-}
-.settings-row{
-  display:flex;
-  gap:10px;
-  align-items:center;
-  margin:10px 0;
-}
-.settings-row input, .settings-row textarea{
-  flex:1;
-  padding:12px 16px;
-  border-radius:10px;
-  border:1px solid rgba(148,163,184,0.1);
-  background:rgba(30,41,59,0.5);
-  color:var(--text);
-  font-size:14px;
-  transition:all 0.3s ease;
-}
-.settings-row input:focus, .settings-row textarea:focus{
-  outline:none;
-  border-color:var(--accent);
-  background:rgba(30,41,59,0.8);
-  box-shadow:0 0 0 3px rgba(139,92,246,0.1);
-}
-.room-item{
-  padding:12px 14px;
-  border-radius:10px;
-  background:rgba(139,92,246,0.05);
-  border:1px solid var(--border);
-  margin-bottom:10px;
-  display:flex;
-  justify-content:space-between;
-  align-items:center;
-  gap:10px;
-  transition:all 0.2s ease;
-}
-.room-item:hover{
-  background:rgba(139,92,246,0.1);
-}
-.small-muted{
-  font-size:12px;
-  color:var(--muted);
-}
-.copy-btn{
-  padding:10px 14px;
-  border-radius:10px;
-  border:1px solid var(--border);
-  background:rgba(139,92,246,0.1);
-  color:var(--text);
-  font-size:13px;
-  font-weight:600;
-  cursor:pointer;
-  transition:all 0.2s ease;
-}
-.copy-btn:hover{
-  background:rgba(139,92,246,0.2);
-  transform:translateY(-2px);
-}
-.full-btn{
-  width:100%;
-  padding:12px;
-  border-radius:10px;
-  border:none;
-  background:var(--msg-me);
-  color:#fff;
-  font-weight:700;
-  font-size:14px;
-  cursor:pointer;
-  transition:all 0.3s ease;
-  box-shadow:0 4px 16px rgba(139,92,246,0.4);
-}
-.full-btn:hover{
-  transform:translateY(-2px);
-  box-shadow:0 8px 24px rgba(139,92,246,0.6);
-}
-@media (max-width:768px){
-  .msg{max-width:90%}
-  .settings-modal{
-    left:12px;
-    right:12px;
-    max-width:calc(100% - 24px);
-    bottom:100px;
-  }
-  .settings-row{
-    flex-direction:column;
-    align-items:stretch;
-  }
-  .copy-btn, .full-btn{width:100%}
-  .header{padding:12px 16px}
-  .hamburger, .icon{width:44px;height:44px;font-size:18px}
-  .avatar{width:46px;height:46px}
-}
-</style>
-</head><body>
-<div class="app">
-  <div class="header">
-    <div class="hamburger" id="btn_hamburger" title="Rooms">☰</div>
-    <div class="avatar"><img id="my_avatar" src="{{ user['avatar'] }}"></div>
-    <div>
-      <div class="title" id="chat_title">{{ current_room_name }}</div>
-      <div class="presence" id="presence">Connected</div>
-    </div>
-    <div style="flex:1"></div>
-    <div style="display:flex;gap:8px">
-      <button id="btn_notif" class="icon" title="Notifications">🔔</button>
-      <button id="btn_settings" class="icon" title="Settings">⚙️</button>
-      <a href="/logout" class="icon" title="Logout">⤴️</a>
-    </div>
-  </div>
-
-  <div id="rooms_panel" class="rooms-panel"></div>
-
-  <div id="messages" class="messages" role="log" aria-live="polite"></div>
-
-  <div id="preview" class="preview-row"></div>
-
-  <div class="bottom">
-    <div class="inputbar" role="form" aria-label="Send message">
-      <button id="btn_file" class="icon" title="Attach">📎</button>
-      <button id="btn_sticker" class="icon" title="Stickers">😊</button>
-      <textarea id="input" class="textarea" placeholder="Message"></textarea>
-      <button id="btn_send" class="send">Send</button>
-    </div>
-  </div>
-
-  <div id="toast" class="toast"></div>
-  <div id="notif_center" class="notif-center"></div>
-  <div id="settings_modal" class="settings-modal"></div>
-</div>
-
-<input id="file_input" type="file" accept="image/*,video/*" multiple style="display:none">
-
-<script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.1/socket.io.min.js"></script>
-<script>
-const MAX_FILES = {{ max_files }};
-const IMAGE_EXTS = {{ image_exts|tojson }};
-const VIDEO_EXTS = {{ video_exts|tojson }};
-const MAX_FILE_SIZE = {{ max_file_size }};
-const INITIAL_ROOM_ID = {{ room_id }};
-
-// Injected user info
-const MY_USERNAME = {{ user['username']|tojson }};
-const MY_ID = {{ user['id'] if user and user.get('id') is not none else 'null' }};
-
-let socket;
-let selected = []; // {file, preview, type, uploadedName}
-const messagesEl = document.getElementById("messages");
-const inputEl = document.getElementById("input");
-const fileInput = document.getElementById("file_input");
-const previewEl = document.getElementById("preview");
-const toast = document.getElementById("toast");
-const notifCenter = document.getElementById("notif_center");
-const roomsPanel = document.getElementById("rooms_panel");
-const settingsModal = document.getElementById("settings_modal");
-const chatTitle = document.getElementById("chat_title");
-let currentRoomId = INITIAL_ROOM_ID;
-let replyTo = null;
-
-function showToast(msg, timeout=2500){
-  toast.textContent = msg;
-  toast.classList.add("show");
-  setTimeout(()=> toast.classList.remove("show"), timeout);
-}
-
-function init(){
-  // prefer websocket, fallback to polling
-  socket = io({transports:["websocket","polling"], upgrade:true});
-  socket.on("connect", ()=> {
-    console.log("socket connected");
-    try { socket.emit("switch_room", {room_id: currentRoomId}); } catch(e){}
-  });
-  socket.on("connect_error", (err)=> console.warn("socket connect error", err));
-  socket.on("new_message", onNewMessageEvent);
-  socket.on("reaction", onReactionEvent);
-  socket.on("edit", onEditEvent);
-  socket.on("delete", onDeleteEvent);
-  socket.on("pinned", onPinnedEvent);
-  socket.on("presence", d=> console.log("presence", d));
-  socket.on("notification", n=> showToast(n.text || "Notification"));
-  socket.on("typing", d=> showTyping(d));
-  socket.on("read_receipt", d=> {});
-
-  loadMessages();
-  loadRooms();
-  document.getElementById("btn_send").addEventListener("click", sendMessage);
-  document.getElementById("btn_file").addEventListener("click", ()=> fileInput.click());
-  fileInput.addEventListener("change", handleFiles);
-  document.getElementById("btn_sticker").addEventListener("click", toggleStickers);
-  document.getElementById("btn_notif").addEventListener("click", showNotifCenter);
-  document.getElementById("btn_settings").addEventListener("click", toggleSettings);
-  document.getElementById("btn_hamburger").addEventListener("click", toggleRoomsPanel);
-  inputEl.addEventListener("input", ()=> {
-    try { socket.emit("typing", {is_typing: true}); } catch(e){}
-    clearTimeout(window._typingTimer);
-    window._typingTimer = setTimeout(()=> { try { socket.emit("typing", {is_typing: false}); } catch(e){} }, 1000);
-  });
-  window.addEventListener("resize", ()=> messagesEl.scrollTop = messagesEl.scrollHeight);
-  messagesEl.addEventListener("click", handleMessageClick);
-  addSwipeListeners();
-}
-
-async function loadRooms(){
-  const r = await fetch("/api/rooms");
-  const j = await r.json();
-  roomsPanel.innerHTML = "";
-  j.rooms.forEach(room=>{
-    const el = document.createElement("div"); el.className="room"; el.textContent = room.name; el.dataset.id = room.id;
-    if(room.id == j.current) el.classList.add("active");
-    el.onclick = ()=> switchRoom(room.id);
-    roomsPanel.appendChild(el);
-  });
-  currentRoomId = j.current;
-}
-
-async function switchRoom(rid){
-  const r = await fetch("/api/switch_room", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({room_id: rid})});
-  const j = await r.json();
-  if(!j.ok) { showToast(j.error || "Cannot switch"); return; }
-  currentRoomId = rid;
-  roomsPanel.querySelectorAll(".room").forEach(el=> el.classList.toggle("active", el.dataset.id == rid));
-  try { socket.emit("switch_room", {room_id: rid}); } catch(e){}
-  await loadMessages();
-  const m = await fetch("/api/messages?limit=1");
-  const mj = await m.json();
-  if(mj.room) chatTitle.textContent = mj.room.name;
-  showToast("Switched room");
-}
-
-/* Toggle rooms panel */
-function toggleRoomsPanel(){
-  roomsPanel.style.display = roomsPanel.style.display === "block" ? "none" : "block";
-}
-
-/* SETTINGS UI */
-function toggleSettings(){
-  if(settingsModal.style.display === "block"){ settingsModal.style.display = "none"; return; }
-  settingsModal.innerHTML = `
-    <div style="display:flex;justify-content:space-between;align-items:center;">
-      <h3>Settings</h3>
-      <button id="close_settings" class="copy-btn">✕</button>
-    </div>
-    <div style="margin-top:8px;">
-      <strong>Profile</strong>
-      <div style="margin-top:8px">
-        <div class="settings-row">
-          <img id="settings_avatar_preview" src="{{ user['avatar'] }}" style="width:64px;height:64px;border-radius:12px;object-fit:cover">
-          <div style="flex:1">
-            <input id="settings_display" placeholder="Display name (Please enter your telegram profile name)" value="{{ user['display_name'] or user['username'] }}">
-            <input id="settings_username" placeholder="Username" value="{{ user['username'] }}">
-            <textarea id="settings_bio" placeholder="Bio" rows="2">{{ user['bio'] or '' }}</textarea>
-            <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
-              <input id="settings_avatar_file" type="file" accept="image/*" style="display:none">
-              <button id="btn_change_avatar" class="copy-btn">Change avatar</button>
-              <button id="btn_save_profile" class="full-btn">Save profile</button>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <hr style="border:none;border-top:1px solid rgba(255,255,255,0.04);margin:12px 0">
-
-      <strong>Create room</strong>
-      <div style="margin-top:8px" id="create_room_box">
-        <div class="settings-row">
-          <input id="create_room_name" placeholder="Room name">
-          <input id="create_room_password" placeholder="Optional password">
-        </div>
-        <div style="margin-top:8px">
-          <button id="btn_create_room" class="full-btn">Create room</button>
-        </div>
-        <div class="small-muted" style="margin-top:8px">After create you'll see the room key (copied to clipboard). Share it to let others join.</div>
-      </div>
-
-      <hr style="border:none;border-top:1px solid rgba(255,255,255,0.04);margin:12px 0">
-
-      <strong>Join room</strong>
-      <div style="margin-top:8px" id="join_room_box">
-        <div class="settings-row">
-          <input id="join_room_key" placeholder="Room key">
-          <input id="join_room_password" placeholder="Room password (if any)">
-        </div>
-        <div style="margin-top:8px">
-          <button id="btn_join_room" class="full-btn">Join room</button>
-        </div>
-      </div>
-
-      <hr style="border:none;border-top:1px solid rgba(255,255,255,0.04);margin:12px 0">
-
-      <strong>My rooms</strong>
-      <div id="my_rooms_list" style="margin-top:8px;max-height:220px;overflow:auto"></div>
-
-      <div style="margin-top:12px;display:flex;gap:8px">
-        <button id="btn_cancel_settings" class="copy-btn">Cancel</button>
-      </div>
-    </div>
-  `;
-  settingsModal.style.display = "block";
-  document.getElementById("close_settings").onclick = ()=> settingsModal.style.display = "none";
-  document.getElementById("btn_cancel_settings").onclick = ()=> settingsModal.style.display = "none";
-  document.getElementById("btn_change_avatar").onclick = ()=> document.getElementById("settings_avatar_file").click();
-  document.getElementById("settings_avatar_file").addEventListener("change", handleAvatarFile);
-  document.getElementById("btn_save_profile").onclick = saveProfile;
-  document.getElementById("btn_create_room").onclick = createRoomFromSettings;
-  document.getElementById("btn_join_room").onclick = joinRoomFromSettings;
-  loadSettingsRooms();
-}
-
-function handleAvatarFile(ev){
-  const f = ev.target.files && ev.target.files[0];
-  if(!f) return;
-  if(f.size > MAX_FILE_SIZE){ showToast("Avatar too large"); return; }
-  const preview = document.getElementById("settings_avatar_preview");
-  preview.src = URL.createObjectURL(f);
-}
-
-async function saveProfile(){
-  const display = document.getElementById("settings_display").value.trim();
-  const username = document.getElementById("settings_username").value.trim();
-  const bio = document.getElementById("settings_bio").value.trim();
-  const fileInputEl = document.getElementById("settings_avatar_file");
-  const fd = new FormData();
-  fd.append("display_name", display);
-  fd.append("username", username);
-  fd.append("bio", bio);
-  if(fileInputEl.files && fileInputEl.files[0]){
-    fd.append("avatar", fileInputEl.files[0]);
-  }
-  const r = await fetch("/api/profile", {method:"POST", body: fd});
-  const j = await r.json();
-  if(j.ok){
-    showToast("Profile saved");
-    if(j.profile && j.profile.avatar){
-      document.getElementById("my_avatar").src = j.profile.avatar;
-    }
-  } else {
-    showToast(j.error || "Save failed");
-  }
-}
-
-/* Create room from settings */
-async function createRoomFromSettings(){
-  const name = document.getElementById("create_room_name").value.trim() || (document.getElementById("chat_title").textContent || "");
-  const password = document.getElementById("create_room_password").value || "";
-  const fd = new FormData();
-  fd.append("name", name);
-  fd.append("password", password);
-  const r = await fetch("/api/room_create", {method:"POST", body: fd});
-  const j = await r.json();
-  if(!j.ok){ showToast(j.error || "Create failed"); return; }
-  showToast("Room created — key copied");
-  try { await navigator.clipboard.writeText(j.room.key); } catch(e){}
-  const info = `Room: ${j.room.name}\nKey: ${j.room.key}\n${j.password ? ("Password: " + j.password) : "No password"}`;
-  alert(info);
-  loadSettingsRooms();
-  loadRooms();
-}
-
-/* Join room from settings */
-async function joinRoomFromSettings(){
-  const key = document.getElementById("join_room_key").value.trim();
-  const password = document.getElementById("join_room_password").value || "";
-  if(!key){ showToast("Enter room key"); return; }
-  const fd = new FormData();
-  fd.append("room_key", key);
-  fd.append("password", password);
-  const r = await fetch("/api/room_join", {method:"POST", body: fd});
-  const j = await r.json();
-  if(!j.ok){ showToast(j.error || "Join failed"); return; }
-  showToast("Joined room");
-  loadSettingsRooms();
-  loadRooms();
-}
-
-/* load settings rooms */
-async function loadSettingsRooms(){
-  const r = await fetch("/api/rooms");
-  const j = await r.json();
-  const el = document.getElementById("my_rooms_list");
-  el.innerHTML = "";
-  j.rooms.forEach(room=>{
-    const div = document.createElement("div"); div.className = "room-item";
-    const left = document.createElement("div"); left.style.flex = "1";
-    left.innerHTML = `<div style="font-weight:700">${escapeHtml(room.name)}</div><div class="small-muted">id: ${room.id}</div>`;
-    const right = document.createElement("div"); right.style.display="flex"; right.style.gap="6px";
-    const btnSwitch = document.createElement("button"); btnSwitch.className="copy-btn"; btnSwitch.textContent = "Switch";
-    btnSwitch.onclick = ()=> { switchRoom(room.id); settingsModal.style.display = "none"; };
-    right.appendChild(btnSwitch);
-    if(room.owned){
-      const keyBtn = document.createElement("button"); keyBtn.className="copy-btn"; keyBtn.textContent = "Copy key";
-      keyBtn.onclick = async ()=> { try { await navigator.clipboard.writeText(room.key); showToast("Key copied"); } catch(e){ showToast("Copy failed"); } };
-      right.appendChild(keyBtn);
-      const setPwd = document.createElement("button"); setPwd.className="copy-btn"; setPwd.textContent = "Set password";
-      setPwd.onclick = async ()=> {
-        const pw = prompt("New password (leave blank to clear):");
-        if(pw === null) return;
-        const fd = new FormData(); fd.append("room_id", room.id); fd.append("password", pw || "");
-        const r2 = await fetch("/api/room_set_password", {method:"POST", body: fd});
-        const j2 = await r2.json();
-        if(!j2.ok) { showToast(j2.error || "Failed"); return; }
-        showToast(pw ? "Password set" : "Password cleared");
-        if(pw) { alert("Password (copy it now): " + pw); }
-        loadSettingsRooms();
-      };
-      right.appendChild(setPwd);
-      const info = document.createElement("div"); info.className="small-muted"; info.style.marginLeft="8px"; info.textContent = `Key: ${room.key} ${room.has_password ? " • password set" : ""}`;
-      left.appendChild(info);
-    }
-    div.appendChild(left); div.appendChild(right);
-    el.appendChild(div);
-  });
-}
-
-/* Notifications */
-function showNotifCenter(){
-  if(notifCenter.style.display === "block"){ notifCenter.style.display = "none"; return; }
-  fetch("/api/notifications").then(r=>r.json()).then(j=>{
-    notifCenter.style.display = "block";
-    notifCenter.innerHTML = "<strong>Notifications</strong><hr>";
-    j.notifications.forEach(n=>{ const d=document.createElement("div"); d.style.padding="6px"; d.innerHTML = `<small>${new Date(n.created_at).toLocaleString()}</small><div>${escapeHtml(n.text)}</div>`; notifCenter.appendChild(d); });
-  });
-}
-
-function showTyping(d){
-  const p = document.getElementById("presence");
-  p.textContent = d.is_typing ? `${d.username} is typing…` : "Online";
-}
-
-/* Messages load/render */
-async function loadMessages(){
-  const r = await fetch("/api/messages?limit=200"); const j = await r.json();
-  messagesEl.innerHTML = "";
-  chatTitle.textContent = j.room ? j.room.name : chatTitle.textContent;
-  j.messages.forEach(renderMessage);
-  messagesEl.scrollTop = messagesEl.scrollHeight;
-}
-
-function renderMessage(m){
-  if(!m || !m.id) return null;
-  const el = document.createElement("div");
-  const am = (m.sender && m.sender.username === MY_USERNAME);
-  el.className = "msg " + (am ? "me" : "");
-  el.id = "m"+m.id;
-  el.dataset.msgId = m.id;
-  const meta = document.createElement("div"); meta.className="meta";
-  const displayName = (m.sender && m.sender.display_name) ? m.sender.display_name : (m.sender && m.sender.username) ? m.sender.username : "System";
-  meta.innerHTML = `<strong>${escapeHtml(displayName)}</strong> • ${new Date(m.created_at).toLocaleTimeString()}${m.edited? " • edited":""}`;
-  el.appendChild(meta);
-  if(m.reply_to){
-    const rep = document.createElement("div"); rep.style.fontSize="12px"; rep.style.color="var(--muted)";
-    rep.textContent = "Replying to message #" + m.reply_to;
-    el.appendChild(rep);
-  }
-  const body = document.createElement("div"); body.className="text"; body.innerHTML = m.rendered || escapeHtml(m.text || "");
-  el.appendChild(body);
-  if(m.attachments && m.attachments.length){
-    const att = document.createElement("div"); att.className="attach";
-    m.attachments.forEach(a=>{
-      try {
-        if(a.type==="image"){
-          const img = document.createElement("img"); img.src=a.url; img.loading="lazy"; img.onclick=()=> openPreview(a.url); att.appendChild(img);
-        } else if(a.type==="video"){
-          const v = document.createElement("video"); v.src=a.url; v.controls=true; v.preload="none"; att.appendChild(v);
-        } else if(a.type==="sticker"){
-          const img = document.createElement("img"); img.src=a.url; img.style.width="90px"; att.appendChild(img);
-        } else if(a.type==="file"){
-          const link = document.createElement("a"); link.href = a.url; link.textContent = a.filename || "download.txt"; link.target="_blank"; att.appendChild(link);
-        }
-      } catch(e){}
-    });
-    el.appendChild(att);
-  }
-  const reactionsWrap = document.createElement("div"); reactionsWrap.className="reactions";
-  for(const [emoji, users] of Object.entries(m.reactions || {})){
-    const pill = document.createElement("div"); pill.className="react-pill"; pill.textContent = `${emoji} ${users.length}`;
-    pill.onclick = ()=> react(m.id, emoji);
-    reactionsWrap.appendChild(pill);
-  }
-  el.appendChild(reactionsWrap);
-  const actions = document.createElement("div"); actions.className="actions";
-  actions.innerHTML = `<button onclick="startReply(${m.id})">↩️</button> <button onclick="react(${m.id},'👍')">👍</button>`;
-  if(am){
-    actions.innerHTML += ` <button onclick="editMessage(${m.id})">✏️</button> <button onclick="deleteMessage(${m.id})">🗑️</button>`;
-  }
-  el.appendChild(actions);
-  messagesEl.appendChild(el);
-  return el;
-}
-
-function escapeHtml(s){ return (s||"").replace(/[&<>"']/g, m=> ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])); }
-
-/* Socket handlers */
-function onNewMessageEvent(payload){
-  const chatId = payload.chat_id || (payload.message && payload.message.chat_id);
-  if(chatId != null && currentRoomId != null && chatId !== currentRoomId) return;
-  const msg = payload.message || payload;
-  renderMessage(msg);
-  messagesEl.scrollTop = messagesEl.scrollHeight;
-}
-function onReactionEvent(d){
-  const el = document.getElementById("m"+d.message_id);
-  if(!el) return;
-  const wrap = el.querySelector(".reactions");
-  if(!wrap) return;
-  wrap.innerHTML = "";
-  for(const [emoji, users] of Object.entries(d.reactions || {})){
-    const pill = document.createElement("div"); pill.className="react-pill"; pill.textContent = `${emoji} ${users.length}`;
-    pill.onclick = ()=> react(d.message_id, emoji);
-    wrap.appendChild(pill);
-  }
-}
-function onEditEvent(d){
-  const el = document.getElementById("m"+d.message_id);
-  if(!el) return;
-  const body = el.querySelector(".text");
-  if(body) body.innerHTML = d.rendered || escapeHtml(d.text || "");
-  const meta = el.querySelector(".meta");
-  if(meta && d.edited){
-    if(!meta.innerHTML.includes("• edited")) meta.innerHTML = meta.innerHTML + " • edited";
-  }
-}
-function onDeleteEvent(d){
-  const el = document.getElementById("m"+d.message_id);
-  if(el) el.remove();
-}
-function onPinnedEvent(d){
-  const el = document.getElementById("m"+d.message_id);
-  if(el) el.style.border = "1px solid gold";
-}
-
-/* Files & preview */
-function handleFiles(ev){
-  const files = Array.from(ev.target.files || []);
-  if(!files.length) return;
-  if(selected.length + files.length > MAX_FILES){ showToast("Max "+MAX_FILES+" files"); return; }
-  for(const f of files){
-    const ext = f.name.split(".").pop().toLowerCase();
-    const type = IMAGE_EXTS.includes(ext) ? "image" : (VIDEO_EXTS.includes(ext) ? "video" : null);
-    if(!type){ showToast("Unsupported: "+f.name); continue; }
-    if(f.size > MAX_FILE_SIZE){ showToast("Too large: "+f.name); continue; }
-    const previewUrl = URL.createObjectURL(f);
-    selected.push({file:f, preview:previewUrl, type:type, uploadedName:null});
-  }
-  updatePreview();
-  ev.target.value = "";
-}
-function updatePreview(){
-  previewEl.innerHTML = "";
-  if(!selected.length) return;
-  selected.forEach((s, idx)=>{
-    const wrap = document.createElement("div"); wrap.style.position="relative";
-    const thumb = document.createElement(s.type==="image" ? "img" : "video"); thumb.className="preview-thumb"; thumb.src = s.preview;
-    if(s.type==="video"){ thumb.muted=true; thumb.autoplay=true; thumb.loop=true; thumb.playsInline=true; }
-    wrap.appendChild(thumb);
-    const del = document.createElement("button"); del.textContent="✕"; del.style.position="absolute"; del.style.top="6px"; del.style.right="6px"; del.onclick = ()=> { selected.splice(idx,1); updatePreview(); };
-    wrap.appendChild(del);
-    previewEl.appendChild(wrap);
-  });
-}
-
-/* send message */
-async function sendMessage(){
-  if(!navigator.onLine){ showToast("Offline"); return; }
-  let text = inputEl.value;
-  if(!text && selected.length===0) return;
-
-  const toUpload = selected.filter(s=> !s.uploadedName).map(s=> s.file);
-  if(toUpload.length){
-    const fd = new FormData();
-    toUpload.forEach(f=> fd.append("files", f));
-    const r = await fetch("/api/upload_multiple", {method:"POST", body: fd});
-    const j = await r.json();
-    if(!j.ok){ showToast(j.error || "Upload failed"); return; }
-    let idx=0;
-    for(let i=0;i<selected.length;i++){
-      if(!selected[i].uploadedName){
-        selected[i].uploadedName = j.files[idx].filename;
-        selected[i].type = j.files[idx].type;
-        idx++;
-      }
-    }
-  }
-  const attachments = selected.map(s => ({filename: s.uploadedName, type: s.type}));
-  try {
-    socket.emit("send_message", {text: text, attachments: attachments, reply_to: replyTo || null});
-  } catch(e){ console.error(e); }
-  inputEl.value = ""; selected = []; updatePreview();
-  replyTo = null; renderReplyBanner();
-}
-
-/* react/edit/delete */
-async function react(msgId, emoji){
-  const r = await fetch(`/api/message/${msgId}/react`, {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({emoji:emoji})});
-  const j = await r.json();
-  if(!j.ok) showToast(j.error || "React failed");
-}
-function startReply(msgId){
-  replyTo = msgId; renderReplyBanner();
-  inputEl.focus();
-  showToast("Replying to message " + msgId);
-}
-function renderReplyBanner(){
-  const existing = document.querySelector(".reply-banner");
-  if(existing) existing.remove();
-  if(!replyTo) return;
-  const banner = document.createElement("div"); banner.className="reply-banner";
-  banner.innerHTML = `<div>Replying to #${replyTo}</div><div><button id="cancel_reply" class="copy-btn">✕</button></div>`;
-  const inputbar = document.querySelector(".inputbar");
-  inputbar.parentNode.insertBefore(banner, inputbar);
-  document.getElementById("cancel_reply").onclick = ()=> { replyTo=null; banner.remove(); };
-}
-function editMessage(msgId){
-  const text = prompt("Edit message");
-  if(text === null) return;
-  fetch(`/api/message/${msgId}/edit`, {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({text:text})}).then(r=>r.json()).then(j=>{ if(!j.ok) showToast(j.error||"Edit failed"); });
-}
-function deleteMessage(msgId){
-  if(!confirm("Delete this message?")) return;
-  fetch(`/api/message/${msgId}/delete`, {method:"POST"}).then(r=>r.json()).then(j=>{ if(!j.ok) showToast(j.error||"Delete failed"); });
-}
-
-/* swipe & click */
-function addSwipeListeners(){
-  let startX=0, startY=0, startT=0;
-  messagesEl.addEventListener('touchstart', e=> {
-    const t = e.touches[0];
-    startX = t.clientX; startY = t.clientY; startT = Date.now();
-  });
-  messagesEl.addEventListener('touchend', e=> {
-    const t = e.changedTouches[0];
-    const dx = t.clientX - startX, dy = t.clientY - startY, dt = Date.now() - startT;
-    if(dx > 80 && Math.abs(dy) < 60 && dt < 600){
-      let node = document.elementFromPoint(t.clientX, t.clientY);
-      while(node && !node.dataset?.msgId) node = node.parentNode;
-      if(node && node.dataset?.msgId){
-        startReply(node.dataset.msgId);
-      }
-    }
-  });
-}
-let lastTap = {id:null, time:0};
-function handleMessageClick(e){
-  let node = e.target;
-  while(node && !node.dataset?.msgId) node = node.parentNode;
-  if(!node) return;
-  const id = node.dataset.msgId;
-  const now = Date.now();
-  if(lastTap.id == id && (now - lastTap.time) < 400){
-    react(id, "👍");
-    lastTap = {id:null, time:0};
-  } else {
-    lastTap = {id:id, time:now};
-  }
-}
-
-/* stickers */
-function toggleStickers(){
-  const s = prompt("Sticker: type 'smile' or 'heart' to send");
-  if(!s) return;
-  let name = null;
-  if(s.toLowerCase().includes("smile")) name = "sticker-smile.svg";
-  if(s.toLowerCase().includes("heart")) name = "sticker-heart.svg";
-  if(!name) { showToast("Unknown sticker"); return; }
-  try { socket.emit("send_message", {text:"", attachments:[{filename:name, type:"sticker"}], reply_to: null}); } catch(e){}
-}
-
-/* helpers */
-function openPreview(url){
-  const w = window.open("");
-  w.document.write(`<html><body style="margin:0;background:#000"><img src="${url}" style="width:100%;height:auto"></body></html>`);
-}
-
-window.addEventListener("load", init);
-</script>
-</body></html>
-"""
 
 # ---------------------------
 # Context injection
@@ -1790,10 +549,21 @@ window.addEventListener("load", init);
 @app.context_processor
 def inject_globals():
     return dict(
-        max_files = MAX_FILES_PER_MESSAGE,
-        image_exts = list(ALLOWED_IMAGE_EXT),
-        video_exts = list(ALLOWED_VIDEO_EXT),
-        max_file_size = MAX_FILE_SIZE
+        app_name=APP_NAME,
+        app_icon=APP_ICON,
+        app_tagline=APP_TAGLINE,
+        login_subtitle=LOGIN_SUBTITLE,
+        register_subtitle=REGISTER_SUBTITLE,
+        theme={
+            "accent": app.config.get("THEME_ACCENT", "#ff7a18"),
+            "accent_2": app.config.get("THEME_ACCENT_2", "#ffb347"),
+            "bg": app.config.get("THEME_BG", "#0b1214"),
+            "panel": app.config.get("THEME_PANEL", "#101820"),
+            "card": app.config.get("THEME_CARD", "#141f24"),
+            "text": app.config.get("THEME_TEXT", "#f5f7fa"),
+            "muted": app.config.get("THEME_MUTED", "#a3b3c2"),
+            "border": app.config.get("THEME_BORDER", "rgba(255,122,24,0.2)")
+        }
     )
 
 # ---------------------------
@@ -1804,51 +574,125 @@ def register():
     if request.method == "POST":
         username = (request.form.get("username") or "").strip()
         display = request.form.get("display_name") or username
+        email = (request.form.get("email") or "").strip().lower()
         password = request.form.get("password")
-        if not username or not password:
-            flash("username and password required")
+        if not username or not password or not email:
+            flash("username, email and password required")
             return redirect(url_for("register"))
         if User.query.filter_by(username=username).first():
             flash("username taken")
             return redirect(url_for("register"))
+        if User.query.filter_by(email=email).first():
+            flash("email already registered")
+            return redirect(url_for("register"))
         try:
-            u = User(username=username, display_name=display)
+            u = User(username=username, display_name=display, email=email, email_verified=False)
             u.set_password(password)
+            u.email_verify_otp = generate_otp()
+            u.email_verify_expires = now_utc() + timedelta(minutes=EMAIL_VERIFY_TTL_MIN)
             db.session.add(u); db.session.commit()
             # auto-join default room 1
             if not RoomMember.query.filter_by(room_id=1, user_id=u.id).first():
                 rm = RoomMember(room_id=1, user_id=u.id); db.session.add(rm); db.session.commit()
-            login_user(u, remember=True)
-            flask_session["room_id"] = 1
-            sys_text = f"👋 {u.display_name or u.username} joined Ghost Projects chat"
-            m = Message(sender_id=None, text=sys_text, rendered=render_md(sys_text), reactions=json.dumps({}), read_by=json.dumps([]), attachments=json.dumps([]), chat_id=1)
-            db.session.add(m); db.session.commit()
-            logger.info("New user registered: %s", username)
-            return redirect(url_for("index"))
+            if not send_otp_email(u.email, u.email_verify_otp, "verify your account", u.display_name or u.username):
+                flash("Email send failed. Contact admin.")
+                return redirect(url_for("login"))
+            logger.info("New user registered (pending verify): %s", username)
+            return render_template("verify_otp.html", email=u.email)
         except Exception:
             logger.exception("Registration failed")
             flash("Registration failed")
             return redirect(url_for("register"))
-    return render_template_string(REGISTER_HTML)
+    return render_template("register.html")
 
 @app.route("/login", methods=["GET","POST"])
 def login():
     if request.method == "POST":
-        username = (request.form.get("username") or "").strip()
+        identifier = (request.form.get("username") or "").strip()
         password = request.form.get("password")
         remember = bool(request.form.get("remember"))
-        u = User.query.filter_by(username=username).first()
+        ident_lower = identifier.lower()
+        u = User.query.filter(or_(User.username == identifier, User.email == ident_lower)).first()
         if u and u.check_password(password):
+            if u.email and not u.email_verified:
+                flash("Please verify your email before logging in")
+                return redirect(url_for("login"))
             login_user(u, remember=remember)
             if not RoomMember.query.filter_by(room_id=1, user_id=u.id).first():
                 rm = RoomMember(room_id=1, user_id=u.id); db.session.add(rm); db.session.commit()
             flask_session["room_id"] = 1
-            u.last_seen = datetime.now(timezone.utc); db.session.commit()
-            logger.info("User logged in: %s", username)
+            u.last_seen = now_utc(); db.session.commit()
+            logger.info("User logged in: %s", identifier)
             return redirect(url_for("index"))
         flash("Invalid credentials")
         return redirect(url_for("login"))
-    return render_template_string(LOGIN_HTML)
+    return render_template("login.html")
+
+@app.route("/verify-otp", methods=["GET","POST"])
+def verify_email_otp():
+    if request.method == "POST":
+        email = (request.form.get("email") or "").strip().lower()
+        otp = (request.form.get("otp") or "").strip()
+        u = User.query.filter_by(email=email).first()
+        if not u or not u.email_verify_otp or u.email_verify_otp != otp:
+            flash("Invalid OTP")
+            return redirect(url_for("verify_email_otp", email=email))
+        if is_expired(u.email_verify_expires):
+            flash("OTP expired")
+            return redirect(url_for("verify_email_otp", email=email))
+        u.email_verified = True
+        u.email_verify_otp = None
+        u.email_verify_expires = None
+        db.session.commit()
+        sys_text = USER_JOIN_MESSAGE.format(user=(u.display_name or u.username), app=APP_NAME)
+        m = Message(sender_id=None, text=sys_text, rendered=render_md(sys_text), reactions=json.dumps({}), read_by=json.dumps([]), attachments=json.dumps([]), chat_id=1)
+        db.session.add(m); db.session.commit()
+        login_user(u, remember=True)
+        if not RoomMember.query.filter_by(room_id=1, user_id=u.id).first():
+            db.session.add(RoomMember(room_id=1, user_id=u.id)); db.session.commit()
+        flask_session["room_id"] = 1
+        u.last_seen = now_utc(); db.session.commit()
+        return redirect(url_for("index"))
+    return render_template("verify_otp.html", email=request.args.get("email") or "")
+
+@app.route("/forgot", methods=["GET","POST"])
+def forgot_password():
+    if request.method == "POST":
+        email = (request.form.get("email") or "").strip().lower()
+        if not email:
+            flash("email required")
+            return redirect(url_for("forgot_password"))
+        u = User.query.filter_by(email=email).first()
+        if u:
+            u.reset_otp = generate_otp()
+            u.reset_expires = now_utc() + timedelta(minutes=RESET_TTL_MIN)
+            db.session.commit()
+            send_otp_email(u.email, u.reset_otp, "reset your password", u.display_name or u.username)
+        return render_template("reset_otp.html", email=email)
+    return render_template("forgot.html")
+
+@app.route("/reset-otp", methods=["GET","POST"])
+def reset_password_otp():
+    if request.method == "POST":
+        email = (request.form.get("email") or "").strip().lower()
+        otp = (request.form.get("otp") or "").strip()
+        password = (request.form.get("password") or "").strip()
+        if not email or not otp or not password:
+            flash("email, otp and password required")
+            return redirect(url_for("reset_password_otp", email=email))
+        u = User.query.filter_by(email=email).first()
+        if not u or not u.reset_otp or u.reset_otp != otp:
+            flash("Invalid OTP")
+            return redirect(url_for("reset_password_otp", email=email))
+        if is_expired(u.reset_expires):
+            flash("OTP expired")
+            return redirect(url_for("reset_password_otp", email=email))
+        u.set_password(password)
+        u.reset_otp = None
+        u.reset_expires = None
+        db.session.commit()
+        return render_template("verify_result.html", ok=True, message="Password reset. You can log in now.")
+    return render_template("reset_otp.html", email=request.args.get("email") or "")
 
 @app.route("/logout")
 @login_required
@@ -1857,11 +701,35 @@ def logout():
     flask_session.pop("room_id", None)
     return redirect(url_for("login"))
 
+@app.route("/admin-pn", methods=["GET","POST"])
+def admin_panel():
+    if request.method == "POST":
+        username = (request.form.get("username") or "").strip()
+        password = request.form.get("password") or ""
+        if username == app.config.get("ADMIN_USERNAME") and password == app.config.get("ADMIN_PASSWORD"):
+            flask_session["admin_auth"] = True
+            return redirect(url_for("admin_panel"))
+        flash("Invalid admin credentials")
+    return render_template("admin.html", admin_auth=bool(flask_session.get("admin_auth")))
+
+@app.route("/admin/logout")
+def admin_logout():
+    flask_session.pop("admin_auth", None)
+    return redirect(url_for("admin_panel"))
+
 def require_json(f):
     @wraps(f)
     def wrapper(*a, **kw):
         if not request.is_json and request.method != "GET":
             return jsonify({"error":"JSON required"}), 400
+        return f(*a, **kw)
+    return wrapper
+
+def admin_required(f):
+    @wraps(f)
+    def wrapper(*a, **kw):
+        if not flask_session.get("admin_auth"):
+            return jsonify({"error":"admin auth required"}), 403
         return f(*a, **kw)
     return wrapper
 
@@ -1905,7 +773,14 @@ def api_profile():
             except Exception:
                 logger.exception("Failed to save avatar")
     db.session.commit()
-    return jsonify({"ok":True, "profile": user_to_dict(u)})
+    profile = user_to_dict(u)
+    try:
+        memberships = RoomMember.query.filter_by(user_id=u.id).all()
+        for m in memberships:
+            socketio.emit("profile_update", {"user": profile}, room=f"room_{m.room_id}")
+    except Exception:
+        logger.exception("Failed to emit profile update")
+    return jsonify({"ok":True, "profile": profile})
 
 @app.route("/api/rooms")
 @login_required
@@ -2050,7 +925,7 @@ def api_messages():
             "chat_id": r.chat_id
         })
     room = db.session.get(Room, room_id)
-    room_name = room.name if room else "Ghost Projects chat"
+    room_name = room.name if room else DEFAULT_ROOM_NAME
     return jsonify({"messages": res, "room": {"id": room_id, "name": room_name}})
 
 @app.route("/api/message/<int:msg_id>/react", methods=["POST"])
@@ -2102,6 +977,119 @@ def api_notifications():
     rows = Notification.query.filter_by(user_id=current_user.id).order_by(Notification.created_at.desc()).limit(50).all()
     out = [{"id": n.id, "text": n.text, "link": n.link, "created_at": n.created_at.isoformat(), "seen": n.seen} for n in rows]
     return jsonify({"notifications": out})
+
+@app.route("/api/stickers")
+@login_required
+def api_stickers():
+    return jsonify({"stickers": list_stickers()})
+
+@app.route("/api/admin/settings", methods=["GET","POST"])
+@admin_required
+def api_admin_settings():
+    if request.method == "GET":
+        out = {k: app.config.get(k) for k in ADMIN_SETTINGS_KEYS}
+        return jsonify({"settings": out})
+    data = request.get_json() or {}
+    updates = {}
+    for k in ADMIN_SETTINGS_KEYS:
+        if k in data:
+            updates[k] = data.get(k)
+            app.config[k] = data.get(k)
+    if updates:
+        save_admin_settings(updates)
+        refresh_app_strings()
+    return jsonify({"ok": True, "settings": {k: app.config.get(k) for k in ADMIN_SETTINGS_KEYS}})
+
+@app.route("/api/admin/users")
+@admin_required
+def api_admin_users():
+    users = User.query.order_by(User.id.asc()).all()
+    out = []
+    for u in users:
+        out.append({
+            "id": u.id,
+            "username": u.username,
+            "display_name": u.display_name or u.username,
+            "is_admin": bool(getattr(u, "is_admin", False)),
+            "last_seen": u.last_seen.isoformat() if u.last_seen else None
+        })
+    return jsonify({"users": out})
+
+@app.route("/api/admin/user/<int:user_id>/toggle_admin", methods=["POST"])
+@admin_required
+def api_admin_toggle_admin(user_id):
+    data = request.get_json() or {}
+    is_admin = bool(data.get("is_admin"))
+    u = db.session.get(User, user_id)
+    if not u:
+        return jsonify({"error":"no such user"}), 404
+    if u.username == app.config.get("ADMIN_USERNAME"):
+        return jsonify({"error":"cannot change primary admin"}), 400
+    u.is_admin = is_admin
+    db.session.commit()
+    return jsonify({"ok": True})
+
+@app.route("/api/admin/user/<int:user_id>/remove", methods=["POST"])
+@admin_required
+def api_admin_remove_user(user_id):
+    u = db.session.get(User, user_id)
+    if not u:
+        return jsonify({"error":"no such user"}), 404
+    if u.username == app.config.get("ADMIN_USERNAME"):
+        return jsonify({"error":"cannot remove primary admin"}), 400
+    Message.query.filter_by(sender_id=u.id).update({"sender_id": None})
+    RoomMember.query.filter_by(user_id=u.id).delete()
+    owned = Room.query.filter_by(owner_id=u.id).all()
+    for r in owned:
+        r.owner_id = None
+    db.session.delete(u)
+    db.session.commit()
+    return jsonify({"ok": True})
+
+@app.route("/api/admin/broadcast", methods=["POST"])
+@admin_required
+def api_admin_broadcast():
+    data = request.get_json() or {}
+    text = (data.get("text") or "").strip()
+    if not text:
+        return jsonify({"error":"text required"}), 400
+    admin_user = User.query.filter_by(username=app.config.get("ADMIN_USERNAME")).first()
+    sender_id = admin_user.id if admin_user else None
+    rooms = Room.query.all()
+    created = []
+    for room in rooms:
+        m = Message(
+            sender_id=sender_id,
+            text=text,
+            rendered=render_md(text),
+            reactions=json.dumps({}),
+            read_by=json.dumps([]),
+            attachments=json.dumps([]),
+            chat_id=room.id
+        )
+        db.session.add(m)
+        db.session.flush()
+        created.append(m)
+    for u in User.query.all():
+        db.session.add(Notification(user_id=u.id, text=text, link="/"))
+    db.session.commit()
+    for m in created:
+        sender_payload = user_to_dict(admin_user) if admin_user else {"username":"system","display_name":"System","avatar": DEFAULT_AVATAR}
+        socketio.emit("new_message", {"message": {
+            "id": m.id,
+            "sender": sender_payload,
+            "text": text,
+            "rendered": sanitize_html(render_md(text)),
+            "created_at": m.created_at.isoformat(),
+            "reply_to": None,
+            "edited": False,
+            "pinned": False,
+            "attachments": [],
+            "reactions": {},
+            "read_by": [],
+            "chat_id": m.chat_id
+        }, "chat_id": m.chat_id}, room=f"room_{m.chat_id}")
+    return jsonify({"ok": True})
 
 # ---------------------------
 # Socket handlers
@@ -2243,7 +1231,7 @@ def ws_mark_read(data):
 def not_found(e):
     if request.accept_mimetypes.accept_json and not request.accept_mimetypes.accept_html:
         return jsonify({"error":"not found"}), 404
-    return render_template_string(NOTFOUND_HTML), 404
+    return render_template("404.html"), 404
 
 @app.route("/")
 @login_required
@@ -2256,8 +1244,18 @@ def index():
         if r:
             rooms.append({"id": r.id, "name": r.name})
     current_room = db.session.get(Room, flask_session.get("room_id",1))
-    current_room_name = current_room.name if current_room else "Ghost Projects chat"
-    return render_template_string(MAIN_HTML, user=user, rooms=rooms, current_room_name=current_room_name, max_files=MAX_FILES_PER_MESSAGE, image_exts=list(ALLOWED_IMAGE_EXT), video_exts=list(ALLOWED_VIDEO_EXT), max_file_size=MAX_FILE_SIZE, room_id=flask_session.get("room_id",1))
+    current_room_name = current_room.name if current_room else DEFAULT_ROOM_NAME
+    ui_config = {
+        "maxFiles": MAX_FILES_PER_MESSAGE,
+        "imageExts": list(ALLOWED_IMAGE_EXT),
+        "videoExts": list(ALLOWED_VIDEO_EXT),
+        "maxFileSize": MAX_FILE_SIZE,
+        "roomId": flask_session.get("room_id", 1),
+        "user": user,
+        "appName": APP_NAME,
+        "appIcon": APP_ICON
+    }
+    return render_template("main.html", user=user, rooms=rooms, current_room_name=current_room_name, ui_config=ui_config)
 
 # ---------------------------
 # Startup: create tables & seed
@@ -2266,17 +1264,53 @@ if __name__ == "__main__":
     with app.app_context():
         db.create_all()
         ensure_message_columns()
+        ensure_user_columns()
         if not db.session.get(Room, 1):
-            r = Room(id=1, owner_id=None, name="Ghost Projects chat", room_key="global", password_hash=None)
+            r = Room(id=1, owner_id=None, name=DEFAULT_ROOM_NAME, room_key="global", password_hash=None)
             db.session.add(r); db.session.commit()
-        if not User.query.filter_by(username="admin").first():
-            admin = User(username="admin", display_name="Administrator")
-            admin.set_password("admin")
-            db.session.add(admin); db.session.commit()
-            if not RoomMember.query.filter_by(room_id=1, user_id=admin.id).first():
-                db.session.add(RoomMember(room_id=1, user_id=admin.id)); db.session.commit()
-            sys_msg = Message(sender_id=None, text="Welcome to Ghost Projects chat! Be kind.", rendered=render_md("Welcome to Ghost Projects chat! Be kind."), reactions=json.dumps({}), read_by=json.dumps([]), attachments=json.dumps([]), chat_id=1)
+        else:
+            room = db.session.get(Room, 1)
+            legacy_room_names = {
+                "Ghost Projects chat",
+                "Ghost Projec chat",
+                "Ghost chat",
+                "Ghost Pot chat",
+                "Sukuna Chat 🔥 chat"
+            }
+            if room and room.owner_id is None and room.name in legacy_room_names:
+                room.name = DEFAULT_ROOM_NAME
+                db.session.commit()
+        admin_user = User.query.filter_by(username=app.config.get("ADMIN_USERNAME")).first()
+        if not admin_user:
+            admin_user = User(username=app.config.get("ADMIN_USERNAME"), display_name="Administrator", is_admin=True)
+            admin_user.set_password(app.config.get("ADMIN_PASSWORD"))
+            admin_user.email_verified = True
+            db.session.add(admin_user)
+            db.session.commit()
+        else:
+            admin_user.set_password(app.config.get("ADMIN_PASSWORD"))
+            admin_user.is_admin = True
+            if not admin_user.email_verified:
+                admin_user.email_verified = True
+            db.session.commit()
+        if not RoomMember.query.filter_by(room_id=1, user_id=admin_user.id).first():
+            db.session.add(RoomMember(room_id=1, user_id=admin_user.id)); db.session.commit()
+        legacy_welcome = {
+            "Welcome to Ghost Projects chat! Be kind.",
+            "Welcome to Ghost Projec chat! Be kind.",
+            "Welcome to Ghost chat! Be kind.",
+            "Welcome to Ghost Pot chat! Be kind.",
+            "Welcome to Sukuna Chat 🔥 chat! Be kind."
+        }
+        welcome_msgs = Message.query.filter_by(chat_id=1, sender_id=None).all()
+        for msg in welcome_msgs:
+            if msg.text in legacy_welcome:
+                msg.text = WELCOME_MESSAGE
+                msg.rendered = render_md(WELCOME_MESSAGE)
+        db.session.commit()
+        if not Message.query.filter_by(chat_id=1).first():
+            sys_msg = Message(sender_id=None, text=WELCOME_MESSAGE, rendered=render_md(WELCOME_MESSAGE), reactions=json.dumps({}), read_by=json.dumps([]), attachments=json.dumps([]), chat_id=1)
             db.session.add(sys_msg); db.session.commit()
-            logger.info("Seeded admin and default message")
-    logger.info("Starting Ghost Projects Chat on http://127.0.0.1:5000")
+        logger.info("Admin ensured for %s", admin_user.username)
+    logger.info("Starting %s Chat on http://127.0.0.1:5000", APP_NAME)
     socketio.run(app, host="0.0.0.0", port=int(os.environ.get("PORT",5000)), debug=True, allow_unsafe_werkzeug=True)

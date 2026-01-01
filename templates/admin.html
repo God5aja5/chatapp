@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Admin Panel</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@300;400;500;600&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
+  <style>
+    :root{
+      --accent: {{ theme.accent }};
+      --accent-2: {{ theme.accent_2 }};
+      --bg: {{ theme.bg }};
+      --panel: {{ theme.panel }};
+      --card: {{ theme.card }};
+      --text: {{ theme.text }};
+      --muted: {{ theme.muted }};
+      --border: {{ theme.border }};
+    }
+  </style>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/admin.css') }}">
+</head>
+<body>
+  <div class="ambient"></div>
+  <div class="shell">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-icon">🔧</div>
+        <div>
+          <div class="brand-name">Admin Panel</div>
+          <div class="brand-tagline">Manage everything in one place</div>
+        </div>
+      </div>
+      <div class="actions">
+        <a class="btn ghost" href="/">Back to chat</a>
+        {% if admin_auth %}
+          <a class="btn" href="/admin/logout">Logout</a>
+        {% endif %}
+      </div>
+    </header>
+
+    {% with messages = get_flashed_messages() %}
+      {% if messages %}<div class="flash">{{ messages[0] }}</div>{% endif %}
+    {% endwith %}
+
+    {% if not admin_auth %}
+      <section class="card login">
+        <h2>Admin Login</h2>
+        <p>Enter the admin username and password to continue.</p>
+        <form method="post" action="{{ url_for('admin_panel') }}">
+          <input name="username" placeholder="Admin username" required>
+          <input name="password" type="password" placeholder="Admin password" required>
+          <button type="submit" class="btn">Sign in</button>
+        </form>
+      </section>
+    {% else %}
+      <section class="grid">
+        <div class="card">
+          <h3>Brand & Theme</h3>
+          <p class="muted">Update the app name, tagline, and theme colors.</p>
+          <div class="form" id="settings_form">
+            <div class="row">
+              <label>App name</label>
+              <input id="set_app_name" placeholder="App name">
+            </div>
+            <div class="row">
+              <label>App icon (emoji)</label>
+              <input id="set_app_icon" placeholder="👻">
+            </div>
+            <div class="row">
+              <label>Tagline</label>
+              <input id="set_app_tagline" placeholder="Tagline">
+            </div>
+            <div class="row">
+              <label>Login subtitle</label>
+              <input id="set_login_subtitle" placeholder="Login subtitle">
+            </div>
+            <div class="row">
+              <label>Register subtitle</label>
+              <input id="set_register_subtitle" placeholder="Register subtitle">
+            </div>
+            <div class="row">
+              <label>Welcome message</label>
+              <textarea id="set_welcome_message" rows="3"></textarea>
+            </div>
+            <div class="row">
+              <label>Default room name</label>
+              <input id="set_room_name" placeholder="Default room name">
+            </div>
+            <div class="row">
+              <label>Accent color</label>
+              <input id="set_theme_accent" placeholder="#ff7a18">
+            </div>
+            <div class="row">
+              <label>Accent 2</label>
+              <input id="set_theme_accent2" placeholder="#ffb347">
+            </div>
+            <div class="row">
+              <label>Background</label>
+              <input id="set_theme_bg" placeholder="#0b1214">
+            </div>
+            <div class="row">
+              <label>Panel</label>
+              <input id="set_theme_panel" placeholder="#101820">
+            </div>
+            <div class="row">
+              <label>Card</label>
+              <input id="set_theme_card" placeholder="#141f24">
+            </div>
+            <div class="row">
+              <label>Text color</label>
+              <input id="set_theme_text" placeholder="#f5f7fa">
+            </div>
+            <div class="row">
+              <label>Muted color</label>
+              <input id="set_theme_muted" placeholder="#a3b3c2">
+            </div>
+            <div class="row">
+              <label>Border</label>
+              <input id="set_theme_border" placeholder="rgba(255,122,24,0.2)">
+            </div>
+            <div class="row actions">
+              <button id="btn_save_settings" class="btn">Save settings</button>
+              <button id="btn_cancel_settings" class="btn ghost" type="button">Cancel</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <h3>Broadcast</h3>
+          <p class="muted">Send an announcement to all rooms and notifications.</p>
+          <textarea id="broadcast_text" rows="5" placeholder="Type announcement..."></textarea>
+          <div class="row actions">
+            <button id="btn_broadcast" class="btn">Broadcast</button>
+            <button id="btn_broadcast_cancel" class="btn ghost" type="button">Cancel</button>
+          </div>
+        </div>
+
+        <div class="card full">
+          <h3>Members</h3>
+          <p class="muted">Promote, demote, or remove users.</p>
+          <div id="users_list" class="users"></div>
+        </div>
+      </section>
+    {% endif %}
+  </div>
+
+  {% if admin_auth %}
+  <script src="{{ url_for('static', filename='js/admin.js') }}"></script>
+  {% endif %}
+</body>
+</html>

@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <title>{{ app_name }} Chat</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@300;400;500;600&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
+  <style>
+    :root{
+      --accent: {{ theme.accent }};
+      --accent-2: {{ theme.accent_2 }};
+      --bg: {{ theme.bg }};
+      --panel: {{ theme.panel }};
+      --card: {{ theme.card }};
+      --text: {{ theme.text }};
+      --muted: {{ theme.muted }};
+      --border: {{ theme.border }};
+    }
+  </style>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
+</head>
+<body>
+  <div class="ambient"></div>
+  <div class="app">
+    <div class="header">
+      <button class="hamburger" id="btn_hamburger" title="Rooms">☰</button>
+      <div class="avatar"><img id="my_avatar" src="{{ user['avatar'] }}" alt="Your avatar"></div>
+      <div class="header-main">
+        <div class="title" id="chat_title">{{ current_room_name }}</div>
+        <div class="presence" id="presence">Connected</div>
+      </div>
+      <div class="header-spacer"></div>
+      <div class="brand">
+        <div class="brand-icon">{{ app_icon }}</div>
+        <div>
+          <div class="brand-name">{{ app_name }}</div>
+          <div class="brand-tagline">{{ app_tagline }}</div>
+        </div>
+      </div>
+      <div class="header-actions">
+        <button id="btn_notif" class="icon" title="Notifications">🔔</button>
+        <button id="btn_settings" class="icon" title="Settings">⚙️</button>
+        <a href="/logout" class="icon" title="Logout">⤴️</a>
+      </div>
+    </div>
+
+    <div id="rooms_panel" class="rooms-panel"></div>
+    <div id="stickers_panel" class="stickers-panel"></div>
+
+    <div id="messages" class="messages" role="log" aria-live="polite"></div>
+
+    <div id="preview" class="preview-row"></div>
+
+    <div class="bottom">
+      <div class="inputbar" role="form" aria-label="Send message">
+        <button id="btn_file" class="icon" title="Attach">📎</button>
+        <button id="btn_sticker" class="icon" title="Stickers">😊</button>
+        <textarea id="input" class="textarea" placeholder="Message"></textarea>
+        <button id="btn_send" class="send">Send</button>
+      </div>
+    </div>
+
+    <div id="toast" class="toast"></div>
+    <div id="notif_center" class="notif-center"></div>
+    <div id="settings_modal" class="settings-modal"></div>
+    <div id="setup_modal" class="setup-modal">
+      <div class="setup-card">
+        <h3>Quick setup</h3>
+        <p>Enable notifications and add this chat to your home screen for faster access.</p>
+        <ol>
+          <li>Tap the browser menu ⋮</li>
+          <li>Select “Add to Home screen”</li>
+        </ol>
+        <div class="setup-actions">
+          <button id="btn_setup_ok" class="full-btn">OK</button>
+          <button id="btn_setup_cancel" class="copy-btn">Cancel</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <input id="file_input" type="file" accept="image/*,video/*" multiple style="display:none">
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.1/socket.io.min.js"></script>
+  <script>
+    window.APP_CONFIG = {{ ui_config|tojson }};
+  </script>
+  <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>
