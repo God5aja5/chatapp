@@ -106,10 +106,70 @@ async function sendBroadcast(){
   }
 }
 
+async function backupDatabase(){
+  const btn = document.getElementById('btn_backup_db');
+  btn.disabled = true;
+  btn.textContent = 'Creating backup...';
+  try {
+    const r = await fetch('/api/admin/backup/database');
+    if(r.ok){
+      const blob = await r.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `database-backup-${new Date().toISOString().slice(0,10)}.zip`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      window.URL.revokeObjectURL(url);
+      alert('Database backup downloaded');
+    } else {
+      const j = await r.json();
+      alert(j.error || 'Backup failed');
+    }
+  } catch(e){
+    alert('Backup failed: ' + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Backup Database';
+  }
+}
+
+async function backupFull(){
+  const btn = document.getElementById('btn_backup_full');
+  btn.disabled = true;
+  btn.textContent = 'Creating full backup...';
+  try {
+    const r = await fetch('/api/admin/backup/full');
+    if(r.ok){
+      const blob = await r.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `full-backup-${new Date().toISOString().slice(0,10)}.zip`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      window.URL.revokeObjectURL(url);
+      alert('Full backup downloaded');
+    } else {
+      const j = await r.json();
+      alert(j.error || 'Backup failed');
+    }
+  } catch(e){
+    alert('Backup failed: ' + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Full Backup';
+  }
+}
+
 document.getElementById('btn_save_settings').addEventListener('click', (e)=>{ e.preventDefault(); saveSettings(); });
 document.getElementById('btn_cancel_settings').addEventListener('click', (e)=>{ e.preventDefault(); loadSettings(); });
 document.getElementById('btn_broadcast').addEventListener('click', (e)=>{ e.preventDefault(); sendBroadcast(); });
 document.getElementById('btn_broadcast_cancel').addEventListener('click', (e)=>{ e.preventDefault(); document.getElementById('broadcast_text').value = ''; });
+document.getElementById('btn_backup_db').addEventListener('click', (e)=>{ e.preventDefault(); backupDatabase(); });
+document.getElementById('btn_backup_full').addEventListener('click', (e)=>{ e.preventDefault(); backupFull(); });
 
 loadSettings();
 loadUsers();

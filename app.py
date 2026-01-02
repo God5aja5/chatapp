@@ -19,12 +19,15 @@ import json
 import secrets
 import logging
 import random
+import tempfile
+import shutil
+import zipfile
 from datetime import datetime, timezone, timedelta
 from functools import wraps
 
 from flask import (
     Flask, request, redirect, url_for, send_from_directory, render_template,
-    jsonify, flash, session as flask_session
+    jsonify, flash, session as flask_session, send_file
 )
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import (
@@ -1090,6 +1093,97 @@ def api_admin_broadcast():
             "chat_id": m.chat_id
         }, "chat_id": m.chat_id}, room=f"room_{m.chat_id}")
     return jsonify({"ok": True})
+
+@app.route("/api/admin/backup/database")
+@admin_required
+def api_admin_backup_database():
+    try:
+        temp_dir = tempfile.mkdtemp()
+        zip_path = os.path.join(temp_dir, "database_backup.zip")
+
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            if os.path.exists(DB_PATH):
+                zipf.write(DB_PATH, os.path.basename(DB_PATH))
+
+            if os.path.exists(SETTINGS_PATH):
+                zipf.write(SETTINGS_PATH, os.path.basename(SETTINGS_PATH))
+
+            if os.path.exists(UPLOAD_FOLDER):
+                for root, dirs, files in os.walk(UPLOAD_FOLDER):
+                    for file in files:
+                        file_path = os.path.join(root, file)
+                        arcname = os.path.join("uploads", os.path.relpath(file_path, UPLOAD_FOLDER))
+                        zipf.write(file_path, arcname)
+
+            if os.path.exists(STICKER_FOLDER):
+                for root, dirs, files in os.walk(STICKER_FOLDER):
+                    for file in files:
+                        file_path = os.path.join(root, file)
+                        arcname = os.path.join("stickers", os.path.relpath(file_path, STICKER_FOLDER))
+                        zipf.write(file_path, arcname)
+
+        def cleanup():
+            try:
+                shutil.rmtree(temp_dir)
+            except Exception:
+                logger.exception("Failed to cleanup temp backup dir")
+
+        response = send_file(
+            zip_path,
+            mimetype='application/zip',
+            as_attachment=True,
+            download_name=f'database-backup-{datetime.now().strftime("%Y%m%d-%H%M%S")}.zip'
+        )
+
+        @response.call_on_close
+        def on_close():
+            cleanup()
+
+        return response
+    except Exception:
+        logger.exception("Database backup failed")
+        return jsonify({"error": "Backup failed"}), 500
+
+@app.route("/api/admin/backup/full")
+@admin_required
+def api_admin_backup_full():
+    try:
+        temp_dir = tempfile.mkdtemp()
+        zip_path = os.path.join(temp_dir, "full_backup.zip")
+
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            for root, dirs, files in os.walk(BASE_DIR):
+                dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ['__pycache__', 'node_modules', 'venv', 'env']]
+
+                for file in files:
+                    if file.endswith('.pyc') or file.startswith('.'):
+                        continue
+
+                    file_path = os.path.join(root, file)
+                    arcname = os.path.relpath(file_path, BASE_DIR)
+                    zipf.write(file_path, arcname)
+
+        def cleanup():
+            try:
+                shutil.rmtree(temp_dir)
+            except Exception:
+                logger.exception("Failed to cleanup temp backup dir")
+
+        response = send_file(
+            zip_path,
+            mimetype='application/zip',
+            as_attachment=True,
+            download_name=f'full-backup-{datetime.now().strftime("%Y%m%d-%H%M%S")}.zip'
+        )
+
+        @response.call_on_close
+        def on_close():
+            cleanup()
+
+        return response
+    except Exception:
+        logger.exception("Full backup failed")
+        return jsonify({"error": "Backup failed"}), 500
 
 # ---------------------------
 # Socket handlers
